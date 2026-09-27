@@ -8,10 +8,13 @@ reference implementation (HF `tokenizers`, or `tiktoken` for Kimi):
   encode           chat-templated prompt, special tokens recognized
   encode+cache     same, with the prefix cache on, fed the interleaved stream
                    in order (so cache state carries across requests/sessions)
+  encode+segcache  same, with the segment cache on (256 MiB)
+  segcache-evict   same, with a 1 MiB segment cache that evicts constantly
   split_special    split_special_tokens=True (untrusted-text path)
   ordinary+cache   encode_ordinary with the cache on == without it
   batch            encode_batch == reference
   threads          several Python threads sharing one cached tokenizer
+  threads+segcache the same, sharing one segment-cached tokenizer
   decode           decode(ids) == reference decode, with/without skipping specials
   transformers     (--transformers) patched transformers tokenizer(prompt)
 
@@ -54,12 +57,18 @@ def interleaved_stream(n_sessions: int, quick: bool):
     return out
 
 
-def with_cache(model: str, capacity: int):
-    os.environ["FASTOKENS_INPUT_CACHE"] = str(capacity)
+def with_env(model: str, **env: int):
+    """The fastokens tokenizer built with the given FASTOKENS_* env vars set."""
+    os.environ.update({k: str(v) for k, v in env.items()})
     try:
         return workload.load_fastokens(model)
     finally:
-        del os.environ["FASTOKENS_INPUT_CACHE"]
+        for k in env:
+            del os.environ[k]
+
+
+def with_cache(model: str, capacity: int):
+    return with_env(model, FASTOKENS_INPUT_CACHE=capacity)
 
 
 class Check:
@@ -124,6 +133,10 @@ def check_model(model: str, args) -> bool:
             c.compare(where[i], fast.encode(prompts[i], split_special_tokens=True).ids, array("I", e), ref)
     run("split_special", split_special)
 
+    for name, mib in (("encode+segcache", 256), ("segcache-evict", 1)):
+        seg = with_env(model, FASTOKENS_SEGMENT_CACHE=mib)
+        run(name, lambda c: [c.compare(w, seg.encode(p).ids, e, ref) for w, p, e in zip(where, prompts, exp)])
+
     cached_ord = with_cache(model, 2 * args.sessions)
     run("ordinary+cache", lambda c: [c.compare(w, cached_ord.encode_ordinary(p).ids, array("I", fast.encode_ordinary(p).ids), ref)
                                      for w, p in zip(where, prompts)])
@@ -134,8 +147,7 @@ def check_model(model: str, args) -> bool:
                 c.compare(where[i + j], enc.ids, exp[i + j], ref)
     run("batch", batch)
 
-    def threads(c):
-        shared = with_cache(model, 2 * args.sessions)
+    def threads(c, shared):
         results = [None] * len(prompts)
 
         def worker(k):
@@ -148,7 +160,8 @@ def check_model(model: str, args) -> bool:
             th.join()
         for w, got, e in zip(where, results, exp):
             c.compare(w, got, e, ref)
-    run("threads", threads)
+    run("threads", lambda c: threads(c, with_cache(model, 2 * args.sessions)))
+    run("threads+segcache", lambda c: threads(c, with_env(model, FASTOKENS_SEGMENT_CACHE=256)))
 
     def decode(c):
         last = {s: i for i, (s, _, _) in enumerate(stream)}
