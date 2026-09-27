@@ -1,9 +1,51 @@
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// id lists
+// ---------------------------------------------------------------------------
+
+/// Python `int` objects for token ids, created once and shared by every list
+/// [`u32_list`] builds, so a list costs a reference-count increment per
+/// element instead of allocating (and later freeing) an `int` per element.
+/// Grows to the largest id seen: a few MiB for a typical vocabulary.
+static INTERNED_INTS: Mutex<Vec<Py<PyAny>>> = Mutex::new(Vec::new());
+
+/// Ids at or above this are converted without interning.
+const INTERN_LIMIT: usize = 1 << 20;
+
+/// `values` as a Python `list[int]`.
+///
+/// This is on the serving path: `transformers` reads `ids`, `type_ids` and
+/// `attention_mask` of every encoding, and for a long prompt building those
+/// lists used to cost more than tokenizing it.
+fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>> {
+    // Masks and type ids are usually one repeated value: a C-level `[v] * n`.
+    if let Some(&first) = values.first()
+        && values.iter().all(|&v| v == first)
+    {
+        let one = PyList::new(py, [first])?;
+        return Ok(one
+            .as_sequence()
+            .repeat(values.len())?
+            .into_any()
+            .downcast_into()?);
+    }
+    let max = values.iter().copied().max().unwrap_or(0) as usize;
+    if max >= INTERN_LIMIT {
+        return PyList::new(py, values);
+    }
+    let mut ints = INTERNED_INTS.lock().expect("interned ints lock poisoned");
+    while ints.len() <= max {
+        let next = ints.len() as u32;
+        ints.push(next.into_pyobject(py)?.into_any().unbind());
+    }
+    PyList::new(py, values.iter().map(|&v| ints[v as usize].bind(py)))
+}
 
 // ---------------------------------------------------------------------------
 // PyEncoding
@@ -14,22 +56,16 @@ use serde_json::Value;
 /// Returned directly by `Tokenizer.encode` and `Tokenizer.encode_batch` so
 /// no Python-side wrapping is needed.  Fields that `fastokens` does not
 /// track (`tokens`, `offsets`, `sequence_ids`, `word_ids`) have getters that
-/// raise `NotImplementedError` to match the HuggingFace API surface.
+/// raise `NotImplementedError` to match the HuggingFace API surface; their
+/// setters accept and discard a value.
 #[pyclass(name = "Encoding")]
 pub struct PyEncoding {
-    #[pyo3(get, set)]
     pub ids: Vec<u32>,
-    #[pyo3(get, set)]
     pub attention_mask: Vec<u32>,
-    #[pyo3(get, set)]
     pub type_ids: Vec<u32>,
-    #[pyo3(get, set)]
     pub special_tokens_mask: Vec<u32>,
     #[pyo3(get, set)]
     pub n_sequences: usize,
-    // Backing storage for set-only properties.
-    _sequence_ids: Vec<Option<i64>>,
-    _word_ids: Vec<Option<i64>>,
 }
 
 impl PyEncoding {
@@ -39,8 +75,6 @@ impl PyEncoding {
             type_ids: vec![0u32; n],
             special_tokens_mask: vec![0u32; n],
             n_sequences: 1,
-            _sequence_ids: vec![Some(0); n],
-            _word_ids: vec![None; n],
             ids,
             attention_mask,
         }
@@ -51,8 +85,6 @@ impl PyEncoding {
         self.attention_mask = self.attention_mask[start..end].to_vec();
         self.type_ids = self.type_ids[start..end].to_vec();
         self.special_tokens_mask = self.special_tokens_mask[start..end].to_vec();
-        self._sequence_ids = self._sequence_ids[start..end].to_vec();
-        self._word_ids = self._word_ids[start..end].to_vec();
     }
 
     fn extend_right(&mut self, pad_id: u32, pad_type_id: u32, count: usize) {
@@ -60,8 +92,6 @@ impl PyEncoding {
         self.attention_mask.extend(vec![0u32; count]);
         self.type_ids.extend(vec![pad_type_id; count]);
         self.special_tokens_mask.extend(vec![0u32; count]);
-        self._sequence_ids.extend(vec![None; count]);
-        self._word_ids.extend(vec![None; count]);
     }
 
     fn extend_left(&mut self, pad_id: u32, pad_type_id: u32, count: usize) {
@@ -73,16 +103,10 @@ impl PyEncoding {
         type_ids.extend_from_slice(&self.type_ids);
         let mut special = vec![0u32; count];
         special.extend_from_slice(&self.special_tokens_mask);
-        let mut seq_ids = vec![None; count];
-        seq_ids.extend_from_slice(&self._sequence_ids);
-        let mut word_ids = vec![None; count];
-        word_ids.extend_from_slice(&self._word_ids);
         self.ids = ids;
         self.attention_mask = mask;
         self.type_ids = type_ids;
         self.special_tokens_mask = special;
-        self._sequence_ids = seq_ids;
-        self._word_ids = word_ids;
     }
 }
 
@@ -102,6 +126,44 @@ impl PyEncoding {
 
     fn __repr__(&self) -> String {
         format!("Encoding(num_tokens={})", self.ids.len())
+    }
+
+    // -- Id lists -------------------------------------------------------
+
+    #[getter]
+    fn ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, &self.ids)
+    }
+    #[setter]
+    fn set_ids(&mut self, value: Vec<u32>) {
+        self.ids = value;
+    }
+
+    #[getter]
+    fn attention_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, &self.attention_mask)
+    }
+    #[setter]
+    fn set_attention_mask(&mut self, value: Vec<u32>) {
+        self.attention_mask = value;
+    }
+
+    #[getter]
+    fn type_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, &self.type_ids)
+    }
+    #[setter]
+    fn set_type_ids(&mut self, value: Vec<u32>) {
+        self.type_ids = value;
+    }
+
+    #[getter]
+    fn special_tokens_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        u32_list(py, &self.special_tokens_mask)
+    }
+    #[setter]
+    fn set_special_tokens_mask(&mut self, value: Vec<u32>) {
+        self.special_tokens_mask = value;
     }
 
     // -- Properties that raise NotImplementedError ----------------------
@@ -132,9 +194,7 @@ impl PyEncoding {
         ))
     }
     #[setter]
-    fn set_sequence_ids(&mut self, value: Vec<Option<i64>>) {
-        self._sequence_ids = value;
-    }
+    fn set_sequence_ids(&mut self, _v: &Bound<'_, PyAny>) {}
 
     #[getter]
     fn word_ids(&self) -> PyResult<Vec<Option<i64>>> {
@@ -143,9 +203,7 @@ impl PyEncoding {
         ))
     }
     #[setter]
-    fn set_word_ids(&mut self, value: Vec<Option<i64>>) {
-        self._word_ids = value;
-    }
+    fn set_word_ids(&mut self, _v: &Bound<'_, PyAny>) {}
 
     #[getter]
     fn words(&self) -> PyResult<Vec<Option<i64>>> {
@@ -154,9 +212,7 @@ impl PyEncoding {
         ))
     }
     #[setter]
-    fn set_words(&mut self, value: Vec<Option<i64>>) {
-        self._word_ids = value;
-    }
+    fn set_words(&mut self, _v: &Bound<'_, PyAny>) {}
 
     /// Always empty — fastokens does not produce overflowing sequences.
     #[getter]
@@ -169,8 +225,7 @@ impl PyEncoding {
     // -- Sequence ID helper ---------------------------------------------
 
     fn set_sequence_id(&mut self, sequence_id: i64) {
-        let n = self.ids.len();
-        self._sequence_ids = vec![Some(sequence_id); n];
+        let _ = sequence_id;
     }
 
     // -- Positional mapping (all raise NotImplementedError) -------------
@@ -285,8 +340,6 @@ impl PyEncoding {
         let mut type_ids: Vec<u32> = vec![];
         let mut special_tokens_mask: Vec<u32> = vec![];
         let mut n_sequences: usize = 0;
-        let mut seq_ids: Vec<Option<i64>> = vec![];
-        let mut word_ids: Vec<Option<i64>> = vec![];
 
         for enc_py in &encodings {
             let enc = enc_py.borrow(py);
@@ -295,8 +348,6 @@ impl PyEncoding {
             type_ids.extend_from_slice(&enc.type_ids);
             special_tokens_mask.extend_from_slice(&enc.special_tokens_mask);
             n_sequences += enc.n_sequences;
-            seq_ids.extend_from_slice(&enc._sequence_ids);
-            word_ids.extend_from_slice(&enc._word_ids);
         }
 
         PyEncoding {
@@ -305,8 +356,6 @@ impl PyEncoding {
             type_ids,
             special_tokens_mask,
             n_sequences,
-            _sequence_ids: seq_ids,
-            _word_ids: word_ids,
         }
     }
 }
