@@ -161,6 +161,21 @@ results are bit-identical to tokenizing from scratch. On a ~1M-token shared
 prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
 reuses the whole encoding.
 
+### Segment cache (chat and agent traffic)
+
+Chat-template output is text segments separated by special tokens
+(`<|im_start|>`, `<|im_end|>`, tool-call markers, …), and a multi-turn chat or
+coding agent re-sends its whole history on every request. The opt-in segment
+cache stores each segment's token ids by content, so a request only tokenizes
+the segments it has not seen before; unlike a byte-prefix cache it keeps
+working when a chat template rewrites earlier turns (e.g. drops old
+reasoning). Every hit is checked against the stored text, so results are
+bit-identical to tokenizing from scratch. Enable it with
+`FASTOKENS_SEGMENT_CACHE=<MiB>` (the memory budget for cached text and ids) or
+`Tokenizer::enable_segment_cache(bytes)` in Rust; it is off by default. A
+coding-agent session of ~200k tokens occupies ~1.5 MiB, plus what it shares
+with other sessions (the system prompt and tool definitions) once.
+
 ### Threads and the GIL
 
 `encode`, `encode_ordinary`, `encode_segments` and `encode_batch` release the

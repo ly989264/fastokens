@@ -6,6 +6,7 @@ pub mod normalizers;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
+mod segment_cache;
 pub mod tiktoken;
 
 use std::{
@@ -39,6 +40,7 @@ use self::{
     added_tokens::Segment,
     decoders::Decoder,
     pre_tokenized::{PreTokenizedString, Split as PtSplit},
+    segment_cache::SegmentCache,
 };
 
 #[cfg(feature = "hf-hub")]
@@ -594,6 +596,8 @@ pub struct Tokenizer {
     split_only: Option<PreTokenizer>,
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
+    /// Optional cache of text-segment encodings; `None` (off) unless enabled.
+    segment_cache: Option<SegmentCache>,
     /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
     /// True for metaspace models (e.g. Gemma) whose pre-tokenizer is a no-op
     /// after normalization; false for ByteLevel models, whose regex `Split`
@@ -654,6 +658,7 @@ impl Tokenizer {
             decoder,
             split_only,
             input_cache: input_cache_from_env(),
+            segment_cache: segment_cache::from_env(),
             needs_vocab_splitting,
         })
     }
@@ -798,6 +803,7 @@ impl Tokenizer {
             decoder,
             split_only,
             input_cache: input_cache_from_env(),
+            segment_cache: segment_cache::from_env(),
             needs_vocab_splitting,
         })
     }
@@ -1038,6 +1044,9 @@ impl Tokenizer {
         if let Some(cache) = &self.input_cache {
             cache.lock().unwrap().clear();
         }
+        if let Some(cache) = &self.segment_cache {
+            cache.clear();
+        }
 
         Ok(changed)
     }
@@ -1062,6 +1071,19 @@ impl Tokenizer {
     /// traffic.
     pub fn enable_input_cache(&mut self, capacity: usize) {
         self.input_cache = Some(Mutex::new(InputCache::new(capacity)));
+    }
+
+    /// Enable the opt-in segment cache, holding at most about `max_bytes` of
+    /// segment text and token ids (also enabled by
+    /// `FASTOKENS_SEGMENT_CACHE=<MiB>`).
+    ///
+    /// When added tokens split an input into text segments, as chat-template
+    /// output always is, each segment's encoding is cached by content and
+    /// reused by later inputs containing the same segment. A coding agent
+    /// re-sends its whole history on every request, so all but the newest
+    /// segments hit. Results are identical to encoding from scratch.
+    pub fn enable_segment_cache(&mut self, max_bytes: usize) {
+        self.segment_cache = Some(SegmentCache::new(max_bytes));
     }
 
     /// Run the full encoding pipeline with control over special token insertion.
@@ -1157,12 +1179,31 @@ impl Tokenizer {
         }
 
         // 1. Normalize the input, optionally recognizing added vocabulary.
-        let mut pts = match policy {
+        let pts = match policy {
             AddedTokenPolicy::All => self.build_pre_tokenized_with(input, false),
             AddedTokenPolicy::SkipSpecial => self.build_pre_tokenized_with(input, true),
             AddedTokenPolicy::None => self.build_pre_tokenized_ordinary(input),
         };
 
+        // 2-3. Pre-tokenize and tokenize, reusing cached segment encodings when
+        //      added tokens split the input into segments.
+        let ids = match &self.segment_cache {
+            Some(cache) if pts.splits().len() > 1 => self.tokenize_segments_cached(&pts, cache)?,
+            _ => self.tokenize_pre_tokenized(pts, true)?,
+        };
+
+        // 4. Post-process.
+        Ok(self.post_process(ids, add_special_tokens))
+    }
+
+    /// Pre-tokenize and tokenize a normalized, added-token-split input,
+    /// returning its core ids (before post-processing). `use_input_cache`
+    /// allows the prefix cache on the single-segment scanner path.
+    fn tokenize_pre_tokenized(
+        &self,
+        mut pts: PreTokenizedString,
+        use_input_cache: bool,
+    ) -> Result<Vec<u32>, Error> {
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
             // Scanner fast path: for a recognized tiktoken pattern with a single
@@ -1187,7 +1228,7 @@ impl Tokenizer {
 
                 // Prefix cache: reuse the leading ids shared with a cached input
                 // and tokenize only the tail, or reuse an exact repeat wholesale.
-                if let Some(cache) = &self.input_cache {
+                if use_input_cache && let Some(cache) = &self.input_cache {
                     let plan = cache.lock().unwrap().reuse_plan(buffer.as_bytes());
                     if let Some(r) = plan {
                         let mut ids =
@@ -1202,7 +1243,7 @@ impl Tokenizer {
                             .map_err(Error::Model)?;
                             ids.extend_from_slice(&tail);
                         }
-                        return Ok(self.post_process(ids, add_special_tokens));
+                        return Ok(ids);
                     }
                     // Miss: full encode recording reuse boundaries, then cache it.
                     let scan_seg_rec = |seg: &str| {
@@ -1222,12 +1263,12 @@ impl Tokenizer {
                         .lock()
                         .unwrap()
                         .insert(buffer.as_bytes(), &ids, bounds);
-                    return Ok(self.post_process(ids, add_special_tokens));
+                    return Ok(ids);
                 }
 
                 let ids = crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg)
                     .map_err(Error::Model)?;
-                return Ok(self.post_process(ids, add_special_tokens));
+                return Ok(ids);
             }
 
             // Scanner path for chat-template output, where added tokens split
@@ -1242,7 +1283,7 @@ impl Tokenizer {
                     self.model.tokenize_scanned_segment(kind, text, out)
                 })
                 .map_err(Error::Model)?;
-                return Ok(self.post_process(ids, add_special_tokens));
+                return Ok(ids);
             }
 
             split.pre_tokenize(&mut pts)?;
@@ -1251,7 +1292,7 @@ impl Tokenizer {
                     self.model.tokenize_batch_fused(buf, splits, out)
                 })
                 .map_err(Error::Model)?;
-            return Ok(self.post_process(ids, add_special_tokens));
+            return Ok(ids);
         }
 
         // 2. Pre-tokenize (refine splits in place).
@@ -1271,12 +1312,125 @@ impl Tokenizer {
         }
 
         // 3. Tokenize each text split with the model.
-        let ids = pts
-            .tokenize(|text, out| self.model.tokenize_into(text, out))
-            .map_err(Error::Model)?;
+        pts.tokenize(|text, out| self.model.tokenize_into(text, out))
+            .map_err(Error::Model)
+    }
 
-        // 4. Post-process.
-        Ok(self.post_process(ids, add_special_tokens))
+    /// [`Self::tokenize_pre_tokenized`] through the segment cache: reuse the
+    /// cached ids of every text split seen before, and tokenize the others in
+    /// one pass through the normal pipeline.
+    ///
+    /// Sound because a text split's ids depend only on its (normalized) text:
+    /// the pipeline after normalization treats every split on its own, which
+    /// is also why the batched miss pass below can be cut back into per-split
+    /// results at the markers it places between them.
+    fn tokenize_segments_cached(
+        &self,
+        pts: &PreTokenizedString,
+        cache: &SegmentCache,
+    ) -> Result<Vec<u32>, Error> {
+        enum Piece {
+            Token(u32),
+            Cached(Arc<[u32]>),
+            Miss(usize),
+        }
+
+        let buffer = pts.buffer();
+        let mut pieces = Vec::with_capacity(pts.splits().len());
+        // Distinct missed segments as (hash, text); repeats within this input
+        // share one entry.
+        let mut misses: Vec<(u64, &str)> = Vec::new();
+        let mut miss_of_hash: HashMap<u64, usize> = HashMap::new();
+        for split in pts.splits() {
+            if let Some(id) = split.token_id {
+                pieces.push(Piece::Token(id));
+                continue;
+            }
+            if split.range.is_empty() {
+                continue;
+            }
+            let text = &buffer[split.range.clone()];
+            let hash = segment_cache::hash_bytes(text.as_bytes());
+            if let Some(&i) = miss_of_hash.get(&hash)
+                && misses[i].1 == text
+            {
+                pieces.push(Piece::Miss(i));
+            } else if let Some(ids) = cache.get(hash, text.as_bytes()) {
+                pieces.push(Piece::Cached(ids));
+            } else {
+                miss_of_hash.entry(hash).or_insert(misses.len());
+                pieces.push(Piece::Miss(misses.len()));
+                misses.push((hash, text));
+            }
+        }
+
+        let miss_ids = self.tokenize_misses(&misses)?;
+        for ((hash, text), ids) in misses.iter().zip(&miss_ids) {
+            cache.insert(*hash, text.as_bytes(), ids);
+        }
+
+        let total = pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Token(_) => 1,
+                Piece::Cached(ids) => ids.len(),
+                Piece::Miss(i) => miss_ids[*i].len(),
+            })
+            .sum();
+        let mut ids = Vec::with_capacity(total);
+        for piece in &pieces {
+            match piece {
+                Piece::Token(id) => ids.push(*id),
+                Piece::Cached(cached) => ids.extend_from_slice(cached),
+                Piece::Miss(i) => ids.extend_from_slice(&miss_ids[*i]),
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Tokenize each of `misses` (normalized text splits), returning their ids
+    /// in order.
+    ///
+    /// All of them go through the pipeline in one pass, so its parallelism and
+    /// fast paths apply as they would to the whole input: they are laid out as
+    /// text splits separated by a marker added token that no vocabulary uses,
+    /// and the result is cut at the markers.
+    fn tokenize_misses(&self, misses: &[(u64, &str)]) -> Result<Vec<Vec<u32>>, Error> {
+        const MARKER: u32 = u32::MAX;
+
+        let one =
+            |text: &str| self.tokenize_pre_tokenized(PreTokenizedString::from_text(text), false);
+        match misses {
+            [] => return Ok(Vec::new()),
+            [(_, text)] => return Ok(vec![one(text)?]),
+            _ => {}
+        }
+
+        let mut buffer = String::with_capacity(misses.iter().map(|(_, t)| t.len()).sum());
+        let mut splits = Vec::with_capacity(misses.len() * 2);
+        for (_, text) in misses {
+            let start = buffer.len();
+            buffer.push_str(text);
+            splits.push(PtSplit {
+                range: start..buffer.len(),
+                token_id: None,
+            });
+            splits.push(PtSplit {
+                range: buffer.len()..buffer.len(),
+                token_id: Some(MARKER),
+            });
+        }
+        let ids = self.tokenize_pre_tokenized(PreTokenizedString::new(buffer, splits), false)?;
+
+        // One marker after each miss, so the cut yields one part per miss plus
+        // an empty tail. A model id equal to the marker would add parts; then
+        // fall back to tokenizing the misses one by one.
+        let parts: Vec<&[u32]> = ids.split(|&id| id == MARKER).collect();
+        if parts.len() == misses.len() + 1 {
+            Ok(parts[..misses.len()].iter().map(|p| p.to_vec()).collect())
+        } else {
+            misses.iter().map(|(_, text)| one(text)).collect()
+        }
     }
 
     /// Encode a batch of inputs.
@@ -2169,6 +2323,186 @@ mod local_tests {
                 );
             }
         }
+    }
+
+    // ── Segment cache ───────────────────────────────────────────────────
+
+    /// A byte-level BPE `tokenizer.json` (every byte symbol plus a few merges)
+    /// with the given normalizer and pre-tokenizer, a special added token and
+    /// a non-special one that strips surrounding whitespace.
+    fn segment_test_tokenizer(normalizer: Value, pre_tokenizer: Value) -> Tokenizer {
+        let mut alphabet: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+            .into_iter()
+            .collect();
+        alphabet.sort_unstable();
+        let mut vocab: serde_json::Map<String, Value> = alphabet
+            .iter()
+            .enumerate()
+            .map(|(id, c)| (c.to_string(), json!(id)))
+            .collect();
+        let merges = ["Ġ t", "h e", "Ġt he", "i n", "in g", "Ċ Ċ"];
+        for merge in merges {
+            let id = vocab.len();
+            vocab.insert(merge.replace(' ', ""), json!(id));
+        }
+        let n = vocab.len();
+        let added = |id: usize, content: &str, strip: bool, special: bool| {
+            json!({"id": id, "content": content, "single_word": false, "lstrip": strip,
+                   "rstrip": strip, "normalized": false, "special": special})
+        };
+        let config = json!({
+            "version": "1.0",
+            "added_tokens": [added(n, "<|a|>", false, true), added(n + 1, "<|b|>", true, false)],
+            "normalizer": normalizer,
+            "pre_tokenizer": pre_tokenizer,
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel"},
+            "model": {"type": "BPE", "vocab": vocab, "merges": merges},
+        });
+        Tokenizer::from_json(config).unwrap()
+    }
+
+    /// The request stream of a multi-turn chat: every request is the whole
+    /// history so far, messages are wrapped in added tokens (sometimes with
+    /// surrounding whitespace, sometimes adjacent), some messages repeat, and
+    /// now and then an earlier message is dropped, rewriting the history.
+    fn segment_test_requests(seed: u64, specials: &[&str]) -> Vec<String> {
+        let mut x = seed;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) as usize
+        };
+        let mut history: Vec<String> = Vec::new();
+        let mut requests = Vec::new();
+        for turn in 0..60 {
+            let r = next();
+            let body = if r % 5 == 0 && !history.is_empty() {
+                history[next() % history.len()].clone()
+            } else {
+                scan_test_input(seed * 1000 + turn, next() % 3000, usize::MAX, true)
+            };
+            let open = specials[next() % specials.len()];
+            let close = specials[next() % specials.len()];
+            let pad = [" ", "", "\n", "  "][next() % 4];
+            history.push(format!("{open}{pad}{body}{pad}{close}"));
+            if r % 11 == 0 && history.len() > 2 {
+                history.remove(1);
+            }
+            requests.push(history.concat());
+        }
+        requests
+    }
+
+    #[test]
+    fn segment_cache_matches_uncached_encoding() {
+        let byte_level = |regex: bool, prefix: bool| json!({"type": "ByteLevel", "add_prefix_space": prefix, "trim_offsets": true, "use_regex": regex});
+        let split = |regex: &str| json!({"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": false});
+        type Build = Box<dyn Fn() -> Tokenizer>;
+        let configs: Vec<(&str, Build)> = vec![
+            (
+                "o200k scanner",
+                Box::new(|| scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN)),
+            ),
+            (
+                "kimi scanner",
+                Box::new(|| scan_test_tokenizer(tiktoken::KIMI_PATTERN)),
+            ),
+            (
+                "o200k regex",
+                Box::new(|| scan_test_tokenizer(&format!("(?:{})", tiktoken::O200K_BASE_PATTERN))),
+            ),
+            (
+                "byte-level regex + prefix space, NFC",
+                Box::new(move || {
+                    segment_test_tokenizer(json!({"type": "NFC"}), byte_level(true, true))
+                }),
+            ),
+            (
+                "prepend normalizer, bulk byte-level",
+                Box::new(move || {
+                    segment_test_tokenizer(
+                        json!({"type": "Prepend", "prepend": ">"}),
+                        byte_level(false, false),
+                    )
+                }),
+            ),
+            (
+                "sequence of splits",
+                Box::new(move || {
+                    segment_test_tokenizer(
+                        Value::Null,
+                        json!({"type": "Sequence", "pretokenizers": [
+                            split(r"\p{N}{1,3}"), split(r"\s+|[^\s\p{N}]+"), byte_level(false, false)
+                        ]}),
+                    )
+                }),
+            ),
+        ];
+
+        for (name, build) in &configs {
+            let plain = build();
+            let specials: Vec<&str> = if plain.token_to_id("<|a|>").is_some() {
+                vec!["<|a|>", "<|b|>"]
+            } else {
+                SCAN_SPECIALS.to_vec()
+            };
+            let requests = segment_test_requests(7, &specials);
+            let expected: Vec<Vec<u32>> =
+                requests.iter().map(|r| plain.encode(r).unwrap()).collect();
+
+            // A roomy cache, and one small enough to evict constantly.
+            for budget in [64 << 20, 16 << 10] {
+                // Cold: every segment of the longest request misses at once.
+                let mut cold = build();
+                cold.enable_segment_cache(budget);
+                let last = requests.len() - 1;
+                assert_eq!(
+                    cold.encode(&requests[last]).unwrap(),
+                    expected[last],
+                    "{name}: cold"
+                );
+
+                let mut cached = build();
+                cached.enable_segment_cache(budget);
+                for (i, (request, want)) in requests.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        &cached.encode(request).unwrap(),
+                        want,
+                        "{name}: request {i}, budget {budget}"
+                    );
+                }
+                // Again, now mostly from the cache, and concurrently.
+                assert_eq!(
+                    cached.encode_batch(&requests, false).unwrap(),
+                    expected,
+                    "{name}: batch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn segment_cache_stays_correct_when_tokens_are_added() {
+        let mut plain = segment_test_tokenizer(
+            Value::Null,
+            json!({"type": "ByteLevel",
+            "add_prefix_space": false, "trim_offsets": true, "use_regex": true}),
+        );
+        let mut cached = segment_test_tokenizer(
+            Value::Null,
+            json!({"type": "ByteLevel",
+            "add_prefix_space": false, "trim_offsets": true, "use_regex": true}),
+        );
+        cached.enable_segment_cache(1 << 20);
+        let input = "<|a|>say hi to <|c|> now<|a|>say hi to <|c|> now";
+        assert_eq!(cached.encode(input).unwrap(), plain.encode(input).unwrap());
+        for tok in [&mut plain, &mut cached] {
+            tok.add_tokens(&[NewToken::special("<|c|>")]).unwrap();
+        }
+        // "say hi to <|c|> now" was cached as one segment; it is now three.
+        assert_eq!(cached.encode(input).unwrap(), plain.encode(input).unwrap());
     }
 
     // ── AddedTokenPolicy ────────────────────────────────────────────────

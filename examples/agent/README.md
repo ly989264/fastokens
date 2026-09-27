@@ -38,9 +38,10 @@ Tokenizer files are downloaded from the Hugging Face Hub on first use.
 ## Correctness: `check.py`
 
 Replays interleaved sessions through `encode`, `encode` with the prefix cache
-on, `split_special_tokens=True`, `encode_ordinary` with the cache on,
-`encode_batch`, several threads sharing one tokenizer, `decode`, and optionally
-the patched `transformers` path. Every result must be bit-identical to the
+on, with the segment cache on (roomy, and tiny so it evicts constantly),
+`split_special_tokens=True`, `encode_ordinary` with the prefix cache on,
+`encode_batch`, several threads sharing one tokenizer (with either cache),
+`decode`, and optionally the patched `transformers` path. Every result must be bit-identical to the
 reference; the first mismatch is printed with its context.
 
 ```
@@ -53,8 +54,8 @@ python examples/agent/check.py --transformers    # full: 3 interleaved sessions 
 | scenario | measures |
 |---|---|
 | `single` | one request at 16k/64k/128k/200k tokens; `tmpl` (real path) vs `ord` (same bytes, no special-token split) |
-| `session` | one agent session end to end: total / p50 / p99 encode time, prefix cache off and on |
-| `server` | 16 sessions interleaved round-robin, cache off and on |
+| `session` | one agent session end to end: total / p50 / p99 encode time with no cache, the prefix cache and the segment cache |
+| `server` | 16 sessions interleaved round-robin, with each cache variant |
 | `gil` | worst stall of a 1 ms ticker thread while another thread encodes |
 | `threads` | aggregate throughput with 1/2/4/8 Python client threads |
 | `tf` | end-to-end through the patched `transformers` tokenizer |
