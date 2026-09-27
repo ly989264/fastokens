@@ -161,6 +161,13 @@ results are bit-identical to tokenizing from scratch. On a ~1M-token shared
 prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
 reuses the whole encoding.
 
+### Threads and the GIL
+
+`encode`, `encode_ordinary`, `encode_segments` and `encode_batch` release the
+GIL for inputs of 16 KiB or more (`encode_batch_flat` always does), so other
+Python threads, such as a serving framework's event loop streaming other
+requests, keep running while a long prompt is tokenized.
+
 ### PCRE2 resource limits
 
 PCRE2 resource limits can be set when constructing a tokenizer to guard against

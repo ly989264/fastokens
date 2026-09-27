@@ -469,6 +469,12 @@ impl From<PyNewToken> for fastokens::NewToken {
     }
 }
 
+/// Inputs at least this large (in bytes, summed over a batch) are encoded with
+/// the GIL released, so other Python threads (e.g. a server's event loop
+/// streaming other requests) keep running meanwhile. Smaller inputs encode in
+/// well under a millisecond, less than a contended GIL hand-off can cost.
+const RELEASE_GIL_MIN_BYTES: usize = 16 * 1024;
+
 fn added_token_policy(split_special_tokens: bool) -> fastokens::AddedTokenPolicy {
     if split_special_tokens {
         fastokens::AddedTokenPolicy::SkipSpecial
@@ -532,6 +538,27 @@ impl PyTokenizer {
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
         self.state.read().expect("PyTokenizer state lock poisoned")
+    }
+
+    /// Run `f` against the state under a read lock, with the GIL released when
+    /// `release_gil` is set.
+    ///
+    /// The read guard only lives for `f`'s call, so it is dropped *before* the
+    /// GIL is re-acquired. Holding it across the re-acquire deadlocks against
+    /// a mutator (`enable_truncation`, `add_tokens`, …) that holds the GIL
+    /// while it waits for the write lock.
+    fn with_state<T: Send>(
+        &self,
+        py: Python<'_>,
+        release_gil: bool,
+        f: impl FnOnce(&TokenizerState) -> T + Send,
+    ) -> T {
+        let run = || f(&self.read());
+        if release_gil {
+            py.allow_threads(run)
+        } else {
+            run()
+        }
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, TokenizerState> {
@@ -919,16 +946,15 @@ impl PyTokenizer {
         split_special_tokens: bool,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
-        let state = self.read();
-        let ids = state
-            .inner
-            .encode_with_policy(
-                input,
-                add_special_tokens,
-                added_token_policy(split_special_tokens),
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Py::new(py, state.build_single_encoding(ids))
+        let policy = added_token_policy(split_special_tokens);
+        let encoding = self.with_state(py, input.len() >= RELEASE_GIL_MIN_BYTES, |state| {
+            let ids = state
+                .inner
+                .encode_with_policy(input, add_special_tokens, policy)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            PyResult::Ok(state.build_single_encoding(ids))
+        })?;
+        Py::new(py, encoding)
     }
 
     /// Encode through the base tokenizer pipeline without recognizing added
@@ -937,12 +963,14 @@ impl PyTokenizer {
     /// Truncation and padding configured via `enable_truncation` /
     /// `enable_padding` are applied before returning.
     fn encode_ordinary(&self, input: &str, py: Python<'_>) -> PyResult<Py<PyEncoding>> {
-        let state = self.read();
-        let ids = state
-            .inner
-            .encode_ordinary(input)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Py::new(py, state.build_single_encoding(ids))
+        let encoding = self.with_state(py, input.len() >= RELEASE_GIL_MIN_BYTES, |state| {
+            let ids = state
+                .inner
+                .encode_ordinary(input)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            PyResult::Ok(state.build_single_encoding(ids))
+        })?;
+        Py::new(py, encoding)
     }
 
     /// Encode a pre-segmented input, concatenating each segment's token ids.
@@ -959,7 +987,6 @@ impl PyTokenizer {
         segments: Vec<(String, bool)>,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
-        let state = self.read();
         let segs: Vec<fastokens::EncodeSegment<'_>> = segments
             .iter()
             .map(|(text, allow_special)| fastokens::EncodeSegment {
@@ -967,11 +994,15 @@ impl PyTokenizer {
                 allow_special: *allow_special,
             })
             .collect();
-        let ids = state
-            .inner
-            .encode_segments(&segs)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Py::new(py, state.build_single_encoding(ids))
+        let bytes: usize = segs.iter().map(|seg| seg.text.len()).sum();
+        let encoding = self.with_state(py, bytes >= RELEASE_GIL_MIN_BYTES, |state| {
+            let ids = state
+                .inner
+                .encode_segments(&segs)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            PyResult::Ok(state.build_single_encoding(ids))
+        })?;
+        Py::new(py, encoding)
     }
 
     /// Encode a batch of inputs in parallel.
@@ -991,36 +1022,45 @@ impl PyTokenizer {
         use rayon::prelude::*;
 
         let policy = added_token_policy(split_special_tokens);
-        let state = self.read();
-        let mut batch: Vec<Vec<u32>> = inputs
-            .par_iter()
-            .map(|s| {
-                state
-                    .inner
-                    .encode_with_policy(s.as_str(), add_special_tokens, policy)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let bytes: usize = inputs.iter().map(String::len).sum();
+        let encodings = self.with_state(py, bytes >= RELEASE_GIL_MIN_BYTES, |state| {
+            let mut batch: Vec<Vec<u32>> = inputs
+                .par_iter()
+                .map(|s| {
+                    state
+                        .inner
+                        .encode_with_policy(s.as_str(), add_special_tokens, policy)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
 
-        for ids in &mut batch {
-            state.do_truncate(ids);
-        }
-
-        let pad_target: Option<usize> = state.pad.as_ref().map(|p| {
-            let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
-            let base = p.length.unwrap_or(max_len).max(max_len);
-            match p.pad_to_multiple_of {
-                Some(m) if m > 0 => base.div_ceil(m) * m,
-                _ => base,
+            for ids in &mut batch {
+                state.do_truncate(ids);
             }
-        });
 
-        batch
+            let pad_target: Option<usize> = state.pad.as_ref().map(|p| {
+                let max_len = batch.iter().map(|ids| ids.len()).max().unwrap_or(0);
+                let base = p.length.unwrap_or(max_len).max(max_len);
+                match p.pad_to_multiple_of {
+                    Some(m) if m > 0 => base.div_ceil(m) * m,
+                    _ => base,
+                }
+            });
+
+            PyResult::Ok(
+                batch
+                    .into_iter()
+                    .map(|ids| {
+                        let target = pad_target.unwrap_or(ids.len());
+                        build_encoding(ids, state.pad.as_ref(), target)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+
+        encodings
             .into_iter()
-            .map(|ids| {
-                let target = pad_target.unwrap_or(ids.len());
-                Py::new(py, build_encoding(ids, state.pad.as_ref(), target))
-            })
+            .map(|encoding| Py::new(py, encoding))
             .collect()
     }
 
@@ -1051,9 +1091,8 @@ impl PyTokenizer {
         use rayon::prelude::*;
 
         let policy = added_token_policy(split_special_tokens);
-        let state = self.read();
-        let mut batch: Vec<Vec<u32>> = py.allow_threads(|| {
-            inputs
+        let (flat, offsets) = self.with_state(py, true, |state| {
+            let mut batch: Vec<Vec<u32>> = inputs
                 .par_iter()
                 .map(|s| {
                     state
@@ -1061,21 +1100,22 @@ impl PyTokenizer {
                         .encode_with_policy(s.as_str(), add_special_tokens, policy)
                         .map_err(|e| PyValueError::new_err(e.to_string()))
                 })
-                .collect::<PyResult<Vec<_>>>()
-        })?;
-        for ids in &mut batch {
-            state.do_truncate(ids);
-        }
+                .collect::<PyResult<Vec<_>>>()?;
+            for ids in &mut batch {
+                state.do_truncate(ids);
+            }
 
-        // Concatenate into one flat id buffer and build cumulative offsets.
-        let total: usize = batch.iter().map(Vec::len).sum();
-        let mut flat: Vec<u32> = Vec::with_capacity(total);
-        let mut offsets: Vec<u64> = Vec::with_capacity(batch.len() + 1);
-        offsets.push(0);
-        for ids in &batch {
-            flat.extend_from_slice(ids);
-            offsets.push(flat.len() as u64);
-        }
+            // Concatenate into one flat id buffer and build cumulative offsets.
+            let total: usize = batch.iter().map(Vec::len).sum();
+            let mut flat: Vec<u32> = Vec::with_capacity(total);
+            let mut offsets: Vec<u64> = Vec::with_capacity(batch.len() + 1);
+            offsets.push(0);
+            for ids in &batch {
+                flat.extend_from_slice(ids);
+                offsets.push(flat.len() as u64);
+            }
+            PyResult::Ok((flat, offsets))
+        })?;
 
         // Reinterpret the id/offset buffers as bytes (same allocation) and copy
         // them into Python `bytes` — no per-element Python objects.
