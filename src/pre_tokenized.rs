@@ -316,6 +316,108 @@ where
     })
 }
 
+/// One unit of work for [`tokenize_scanned_splits`]: an added token's id, or a
+/// text span that starts and ends on pretoken boundaries.
+enum ScanItem<'a> {
+    Token(u32),
+    Text(&'a str),
+}
+
+/// Fused scan+BPE driver for a buffer that also holds added-token splits, as
+/// chat-template output does (`<|im_start|>user\n…<|im_end|>`).
+///
+/// Added tokens are hard pretoken boundaries: the regex path matches each text
+/// split on its own, and so does this, scanning every text split independently.
+/// A split of at least [`SCAN_FUSED_PARALLEL_MIN`] bytes is further cut at
+/// newline pretoken boundaries exactly as [`tokenize_scanned`] cuts a single
+/// segment. The resulting spans are packed, in order, into jobs of similar byte
+/// size that run in parallel; their ids are concatenated in order.
+///
+/// `tokenize_span` appends the token ids of one span to the output.
+pub fn tokenize_scanned_splits<F>(
+    pts: &PreTokenizedString,
+    kind: crate::pre_tokenizers::scan::ScanKind,
+    tokenize_span: F,
+) -> Result<Vec<u32>, String>
+where
+    F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
+{
+    let buffer = pts.buffer();
+    let pool = bpe_pool();
+    let threads = pool.current_num_threads();
+    let parallel = buffer.len() >= SCAN_FUSED_PARALLEL_MIN && threads >= 2;
+
+    let mut items = Vec::with_capacity(pts.splits().len());
+    for split in pts.splits() {
+        if let Some(id) = split.token_id {
+            items.push(ScanItem::Token(id));
+        } else if !split.range.is_empty() {
+            let text = &buffer[split.range.clone()];
+            if parallel && text.len() >= SCAN_FUSED_PARALLEL_MIN {
+                let n_chunks = threads.min(text.len() / (32 * 1024)).max(2);
+                for (s, e) in
+                    crate::pre_tokenizers::scan::newline_chunk_bounds(text, n_chunks, kind)
+                {
+                    items.push(ScanItem::Text(&text[s..e]));
+                }
+            } else {
+                items.push(ScanItem::Text(text));
+            }
+        }
+    }
+
+    let run = |items: &[ScanItem<'_>], ids: &mut Vec<u32>| -> Result<(), String> {
+        for item in items {
+            match *item {
+                ScanItem::Token(id) => ids.push(id),
+                ScanItem::Text(text) => tokenize_span(text, ids)?,
+            }
+        }
+        Ok(())
+    };
+
+    if !parallel {
+        let mut ids = Vec::with_capacity(buffer.len() / 3 + items.len());
+        run(&items, &mut ids)?;
+        return Ok(ids);
+    }
+
+    // Several jobs per thread, so work-stealing evens out spans of uneven cost.
+    let target = (buffer.len() / (threads * 4)).max(32 * 1024);
+    let mut jobs: Vec<(Range<usize>, usize)> = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, item) in items.iter().enumerate() {
+        if let ScanItem::Text(text) = item {
+            bytes += text.len();
+        }
+        if bytes >= target {
+            jobs.push((start..i + 1, bytes));
+            (start, bytes) = (i + 1, 0);
+        }
+    }
+    if start < items.len() {
+        jobs.push((start..items.len(), bytes));
+    }
+
+    pool.install(|| {
+        let parts: Result<Vec<Vec<u32>>, String> = jobs
+            .par_iter()
+            .map(|(range, bytes)| {
+                let mut ids = Vec::with_capacity(bytes / 3 + range.len());
+                run(&items[range.clone()], &mut ids)?;
+                Ok(ids)
+            })
+            .collect();
+        let parts = parts?;
+        let total: usize = parts.iter().map(Vec::len).sum();
+        let mut ids = Vec::with_capacity(total);
+        for part in parts {
+            ids.extend(part);
+        }
+        Ok(ids)
+    })
+}
+
 /// A chunk's token ids together with its `(byte_offset, token_index)` reuse
 /// boundaries — the payload a bounded scan produces for the prefix cache.
 type IdsWithBounds = (Vec<u32>, Vec<(u32, u32)>);
