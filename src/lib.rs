@@ -1230,6 +1230,21 @@ impl Tokenizer {
                 return Ok(self.post_process(ids, add_special_tokens));
             }
 
+            // Scanner path for chat-template output, where added tokens split
+            // the input into many text splits. They are hard pretoken
+            // boundaries, so each text split is scanned on its own, just as the
+            // regex path below matches each split on its own.
+            if pts.buffer().len() <= u32::MAX as usize
+                && let PreTokenizer::Split(inner) = split
+                && let Some(kind) = inner.scan_kind()
+            {
+                let ids = crate::pre_tokenized::tokenize_scanned_splits(&pts, kind, |text, out| {
+                    self.model.tokenize_scanned_segment(kind, text, out)
+                })
+                .map_err(Error::Model)?;
+                return Ok(self.post_process(ids, add_special_tokens));
+            }
+
             split.pre_tokenize(&mut pts)?;
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {
@@ -2055,6 +2070,105 @@ mod local_tests {
 
         cache.clear();
         assert!(cache.reuse_plan(b"hello world").is_none());
+    }
+
+    // ── Scanner path over added-token splits ────────────────────────────
+
+    const SCAN_SPECIALS: [&str; 4] = ["<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"];
+
+    /// A tiktoken-style tokenizer for `pattern`: every byte, some merges so
+    /// multi-byte tokens occur, and [`SCAN_SPECIALS`] as special tokens.
+    fn scan_test_tokenizer(pattern: &str) -> Tokenizer {
+        let mut ranks: Vec<(Vec<u8>, u32)> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
+        // Each merge must split into exactly two earlier tokens.
+        for merged in [
+            " t", "th", "he", "in", "er", "an", " a", "re", "on", "  ", "\n\n", "e ", " the",
+            "ing", "  \n", "}\n", "He", "ll", "Hell", "Hello", "'s", " d", " don",
+        ] {
+            let rank = ranks.len() as u32;
+            ranks.push((merged.as_bytes().to_vec(), rank));
+        }
+        let specials = SCAN_SPECIALS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.to_string(), (ranks.len() + i) as u32))
+            .collect();
+        Tokenizer::from_tiktoken_ranks(&ranks, TiktokenConfig::new(pattern, specials)).unwrap()
+    }
+
+    /// Chat-template-like text of at least `len` bytes: code, prose, CJK,
+    /// newline runs, o200k's `/`-trailing punctuation, and a special token
+    /// roughly every `special_every` pieces. Without `newlines` it is one long
+    /// line, like the `|tojson`-escaped tool output of gpt-oss's template.
+    fn scan_test_input(seed: u64, len: usize, special_every: usize, newlines: bool) -> String {
+        const PIECES: [&str; 30] = [
+            "the", " cat", "'s", " don't", "Hello", "WORLD", "中文", "模型", " 123", "4567", "  ",
+            "\n", "\r\n", "\n\n  \n", " /", "/\n/", ".\n/", "{", "}\n", "();", " -> ", "\t", "é",
+            "😀", " ", "'", "ABCdef", "x\n", "\u{3000}", "\\n",
+        ];
+        let mut out = String::new();
+        let mut x = seed;
+        while out.len() < len {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let r = (x >> 33) as usize;
+            if r.is_multiple_of(special_every) {
+                out.push_str(SCAN_SPECIALS[r % SCAN_SPECIALS.len()]);
+                continue;
+            }
+            let piece = PIECES[r % PIECES.len()];
+            if newlines || !piece.contains(['\n', '\r']) {
+                out.push_str(piece);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scanner_matches_regex_path_across_added_tokens() {
+        let fixed = [
+            "",
+            "<|im_start|>",
+            "<|im_start|><|im_end|>",
+            "<|im_start|>user\nHello, world!<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_end|>'s here",
+            "  <|im_end|>  \n\n",
+            "a.\n<|im_end|>/\n/b",
+            "中文<|im_start|>模型 123<tool_call>{\"a\": 1}</tool_call>",
+        ];
+        let mut inputs: Vec<String> = fixed.iter().map(|s| s.to_string()).collect();
+        for seed in 0..4 {
+            inputs.push(scan_test_input(seed, 300, 7, true));
+            inputs.push(scan_test_input(seed, 6_000, 25, true));
+            // Many splits: exercises packing splits into parallel jobs.
+            inputs.push(scan_test_input(seed, 150_000, 40, true));
+            // Few, large splits: each is also cut at newline boundaries.
+            inputs.push(scan_test_input(seed, 300_000, 20_000, true));
+            // Large splits without a newline to cut at.
+            inputs.push(scan_test_input(seed, 200_000, 10_000, false));
+        }
+
+        for pattern in [tiktoken::O200K_BASE_PATTERN, tiktoken::KIMI_PATTERN] {
+            let scan = scan_test_tokenizer(pattern);
+            // Same regex, but not recognized as a scanner family.
+            let regex = scan_test_tokenizer(&format!("(?:{pattern})"));
+            let scan_kind = |tok: &Tokenizer| match &tok.split_only {
+                Some(PreTokenizer::Split(split)) => split.scan_kind(),
+                _ => None,
+            };
+            assert!(scan_kind(&scan).is_some());
+            assert!(scan_kind(&regex).is_none());
+
+            for (i, input) in inputs.iter().enumerate() {
+                assert_eq!(
+                    scan.encode(input).unwrap(),
+                    regex.encode(input).unwrap(),
+                    "input #{i} ({} bytes) diverges for pattern {pattern:?}",
+                    input.len(),
+                );
+            }
+        }
     }
 
     // ── AddedTokenPolicy ────────────────────────────────────────────────
