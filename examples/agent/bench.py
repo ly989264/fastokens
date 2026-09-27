@@ -261,6 +261,9 @@ HIGHER_IS_BETTER = ("threads.mtoks",)
 # only changes beyond NOISE, and leave max_gap out of the comparison.
 NOISE = 0.10
 UNCOMPARED = ("max_gap_ms",)
+# Ticker gaps sit on a ~1.5 ms floor (1 ms sleep + wakeup), where fractions of
+# a millisecond are scheduler jitter: flag them only beyond this many ms.
+GAP_NOISE_MS = 1.0
 
 
 def compare(new, base_path):
@@ -275,6 +278,8 @@ def compare(new, base_path):
                 continue
             speedup = (v / b) if k.startswith(HIGHER_IS_BETTER) else (b / v)
             flag = "  faster" if speedup > 1 + NOISE else "  SLOWER" if speedup < 1 - NOISE else ""
+            if k.endswith("_gap_ms") and abs(v - b) < GAP_NOISE_MS:
+                flag = ""
             print(f"  {model:14} {k:34} {b:10.2f} {v:10.2f} {speedup:7.2f}x{flag}")
 
 
