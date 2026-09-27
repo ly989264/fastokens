@@ -407,6 +407,38 @@ def _glm(msgs, keep="current"):
     return s + "<|assistant|>\n"
 
 
+def _glm5(msgs, keep="current"):
+    """GLM-5.x (checked against GLM-5.2's chat_template.jinja): no newline after
+    the role tokens, a reasoning-effort system line, `<think></think>` on every
+    assistant turn, and tool results grouped after one `<|observation|>`."""
+    tj = "\n".join(json.dumps(t, ensure_ascii=False) for t in tools())
+    s = ("[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\n"
+         "You may call one or more functions to assist with the user query.\n\n"
+         f"You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tj}\n</tools>\n\n"
+         "For each function call, output the function name and arguments within the following XML format:\n"
+         "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+         "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>"
+         f"<|system|>{msgs[0]['content']}")
+    prev = None
+    for i, m in enumerate(msgs[1:], 1):
+        r = m["role"]
+        if r == "user":
+            s += f"<|user|>{m['content']}"
+        elif r == "assistant":
+            think = m.get("reasoning", "") if _keep_reasoning(msgs, i, keep) else ""
+            s += f"<|assistant|><think>{think}</think>{m['content'].strip()}"
+            for c in m.get("tool_calls") or ():
+                args = "".join(f"<arg_key>{k}</arg_key><arg_value>{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}</arg_value>"
+                               for k, v in c["arguments"].items())
+                s += f"\n<tool_call>{c['name']}{args}</tool_call>"
+        else:
+            if prev != "tool":
+                s += "<|observation|>"
+            s += f"<tool_response>{m['content']}</tool_response>"
+        prev = r
+    return s + "<|assistant|><think>"
+
+
 def _harmony(msgs, keep="current"):
     ns = "\n\n".join(f"// {t['description']}\ntype {t['name']} = (_: {json.dumps(t['parameters'])}) => any;" for t in tools())
     s = ("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"
@@ -535,6 +567,7 @@ def _zephyr(msgs, keep="none"):
 MODELS = {
     "qwen3-coder": ("Qwen/Qwen3-Coder-30B-A3B-Instruct", _qwen3_coder, "hf"),
     "glm-4.6": ("zai-org/GLM-4.6", _glm, "hf"),
+    "glm-5.2": ("zai-org/GLM-5.2", _glm5, "hf"),
     "gpt-oss": ("openai/gpt-oss-120b", _harmony, "hf"),
     "minimax-m2": ("MiniMaxAI/MiniMax-M2", _minimax, "hf"),
     "deepseek-v3.1": ("deepseek-ai/DeepSeek-V3.1", _deepseek, "hf"),

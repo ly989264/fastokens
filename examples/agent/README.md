@@ -20,6 +20,7 @@ renders it with each model's own special tokens:
 |---|---|---|
 | `qwen3-coder` | Qwen/Qwen3-Coder-30B-A3B-Instruct | HF `tokenizers` |
 | `glm-4.6` | zai-org/GLM-4.6 | HF `tokenizers` |
+| `glm-5.2` | zai-org/GLM-5.2 | HF `tokenizers` |
 | `gpt-oss` | openai/gpt-oss-120b | HF `tokenizers` |
 | `minimax-m2` | MiniMaxAI/MiniMax-M2 | HF `tokenizers` |
 | `deepseek-v3.1` | deepseek-ai/DeepSeek-V3.1 | HF `tokenizers` |
@@ -74,3 +75,23 @@ whole-input caches cannot flatter a result. Compare only runs from the same,
 otherwise idle machine. Re-running unchanged code moves aggregate metrics by
 under 5% and sub-millisecond single requests by up to ~15%, so `--compare`
 flags only changes beyond 10% and ignores the (single-sample) `max_gap_ms`.
+
+## Traffic simulation: `simulate.py`
+
+Replays realistic opencode traffic against a vLLM-style frontend: N agent
+sessions (few or many), each a loop of whole-history requests with model/tool
+time between them (log-normal, median 3 s) and longer user turns, growing
+until auto-compaction, starting at random points of their lives (steady
+state). One asyncio event loop renders requests and hands tokenization to a
+thread pool through `transformers`; a 5 ms ticker stands in for the SSE
+streaming of every other session. It reports the latency tokenization adds
+per request (queueing + encode), event-loop lag and CPU per request.
+
+```
+python examples/agent/simulate.py --impl hf --sessions 128 --json hf.json
+python examples/agent/simulate.py --impl fastokens --sessions 128 --json ft.json
+FASTOKENS_SEGMENT_CACHE=1024 python examples/agent/simulate.py --impl fastokens --sessions 128
+```
+
+Each run measures whichever `tokenizers` / `fastokens` its interpreter
+imports; compare builds with one virtualenv per build, run back to back.
