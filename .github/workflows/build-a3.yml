@@ -1,0 +1,76 @@
+
+name: Build fastokens for A3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-a3:
+    name: Linux ARM64 Wheel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build Wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          manylinux: manylinux_2_28
+          args: >-
+            --release
+            --locked
+            --out dist
+            -i python3.12
+          sccache: "false"
+          before-script-linux: |
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y openssl-devel perl-IPC-Cmd
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y libssl-dev libatomic-ops-dev
+            else
+              echo "Unsupported build environment"
+              exit 1
+            fi
+
+      - name: Verify Wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh dist/
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+
+          assert (
+              "cp39-abi3-manylinux_2_28_aarch64.whl"
+              in wheel.name
+          ), wheel.name
+
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+              assert any(
+                  name.startswith("fastokens/_native")
+                  and name.endswith(".so")
+                  for name in names
+              ), "Native extension missing"
+
+          print("Wheel structure verified:", wheel.name)
+          PY
+
+      - name: Upload Wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastokens-a3-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+
