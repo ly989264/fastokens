@@ -2,11 +2,13 @@
 
 The first group runs on every build (the observe API must work, and say it is
 off, without the `observe` feature). The rest needs a build with it
-(`maturin build --features observe`) and checks that the counters agree
-exactly with what the test did: each test thread has its own slot in the
-snapshot, so per-thread counts are exact whatever else runs.
+(`maturin build --features observe`) and checks that the counters and the
+analysis agree exactly with what the test did: each test thread has its own
+slot in the snapshot, and pytest runs tests one at a time, so per-thread and
+per-window counts are exact.
 """
 
+import base64
 import json
 import os
 import random
@@ -43,21 +45,38 @@ def _tiny() -> Tokenizer:
     )
 
 
+def _with_env(name, value, make):
+    old = os.environ.get(name)
+    os.environ[name] = str(value)
+    try:
+        return make()
+    finally:
+        if old is None:
+            del os.environ[name]
+        else:
+            os.environ[name] = old
+
+
+def _scanner(tmp_path, **env) -> Tokenizer:
+    """A byte-level tiktoken model with the o200k pattern: the scanner path."""
+    ranks = [bytes([i]) for i in range(256)] + [b"th", b"the", b" the", b"in", b"ing", b" th", b"he", b"ll", b"hell", b"hello"]
+    path = tmp_path / "scan.model"
+    path.write_text("".join(f"{base64.b64encode(t).decode()} {i}\n" for i, t in enumerate(ranks)))
+
+    def make():
+        return Tokenizer.from_tiktoken(str(path), encoding="o200k_base",
+                                       special_tokens={"<|im_start|>": 400, "<|im_end|>": 401})
+
+    for k, v in env.items():
+        make = (lambda m, k, v: lambda: _with_env(k, v, m))(make, k, v)
+    tok = make()
+    assert json.loads(tok.observe())["scanner_path"] is True
+    return tok
+
+
 @pytest.fixture(scope="module")
 def qwen():
     return Tokenizer.from_model(MODEL)
-
-
-def _qwen_with_cache(mib: int) -> Tokenizer:
-    old = os.environ.get("FASTOKENS_SEGMENT_CACHE")
-    os.environ["FASTOKENS_SEGMENT_CACHE"] = str(mib)
-    try:
-        return Tokenizer.from_model(MODEL)
-    finally:
-        if old is None:
-            del os.environ["FASTOKENS_SEGMENT_CACHE"]
-        else:
-            os.environ["FASTOKENS_SEGMENT_CACHE"] = old
 
 
 def _chat(n_turns: int, seed: int = 0, body: int = 200) -> str:
@@ -95,6 +114,12 @@ def _get(url):
         return r.status, r.headers.get("Content-Type"), r.read()
 
 
+def _post(url, body=b""):
+    req = urllib.request.Request(url, data=body, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, r.read()
+
+
 # ── every build ──────────────────────────────────────────────────────────────
 
 
@@ -105,27 +130,28 @@ def test_snapshot_and_tokenizer_json_are_valid_in_every_build():
     t = json.loads(tok.observe())
     assert t["enabled"] is ENABLED
     assert t["segment_cache"] is None
-    assert t["prefix_cache"] is False
+    assert t["prefix_cache"] is None
     s = obs.snapshot(tok)
     assert set(s) >= {"time", "pid", "cpu_s", "rss_bytes", "process", "tokenizers"}
     assert s["tokenizers"]["tokenizer"] == t
     assert obs.enabled() is ENABLED
+    obs.reset_slow()  # a no-op without the feature
 
 
-def test_report_and_prometheus_work_on_any_snapshot():
+def test_report_analyze_and_prometheus_work_on_any_snapshot():
     tok = _tiny()
-    a = obs.snapshot({"tiny": tok})
-    tok.encode("<end>end")
-    b = obs.snapshot({"tiny": tok})
-    text = obs.report(a, b)
+    with obs.profile({"tiny": tok}) as p:
+        tok.encode("<end>end")
+    text = p.report()
     assert isinstance(text, str) and text
+    assert p.data["enabled"] is ENABLED
     if not ENABLED:
         assert "without the `observe` feature" in text
-    prom = obs.prometheus(b)
+    prom = obs.prometheus(p.after)
     assert "fastokens_observe_enabled " + str(int(ENABLED)) in prom
     parser = pytest.importorskip("prometheus_client.parser")
-    families = {f.name: f for f in parser.text_string_to_metric_families(prom)}
-    assert "fastokens_process_cpu_seconds" in families or "fastokens_process_cpu_seconds_total" in families
+    families = {f.name for f in parser.text_string_to_metric_families(prom)}
+    assert any(f.startswith("fastokens_process_cpu_seconds") for f in families)
 
 
 def test_native_of_unwraps_and_rejects():
@@ -144,6 +170,8 @@ def test_native_of_unwraps_and_rejects():
         obs._native_of(object())
     with pytest.raises(TypeError):
         obs.serve({"bad": object()}, port=0)
+    with pytest.raises(TypeError):
+        obs.profile({"bad": object()})
 
 
 def test_native_of_unwraps_a_patched_transformers_tokenizer():
@@ -160,7 +188,7 @@ def test_native_of_unwraps_a_patched_transformers_tokenizer():
         fastokens.unpatch_transformers()
 
 
-def test_http_server_serves_dashboard_json_and_metrics():
+def test_http_server_serves_dashboard_json_metrics_and_posts():
     tok = _tiny()
     server = obs.serve({"tiny": tok}, port=0)
     try:
@@ -178,16 +206,34 @@ def test_http_server_serves_dashboard_json_and_metrics():
         assert status == 200 and ctype.startswith("text/plain")
         parser = pytest.importorskip("prometheus_client.parser")
         assert list(parser.text_string_to_metric_families(body.decode()))
+        # /analyze: the first call has nothing to compare with, the second
+        # analyzes the window since the snapshot it sends.
+        status, body = _post(base + "/analyze")
+        first = json.loads(body)
+        assert first["analysis"] is None
+        tok.encode("end<end>")
+        status, body = _post(base + "/analyze", json.dumps(first["snapshot"]).encode())
+        second = json.loads(body)
+        assert second["analysis"] == obs.analyze(first["snapshot"], second["snapshot"])
+        assert _post(base + "/reset-slow")[0] == 200
         with pytest.raises(urllib.error.HTTPError) as e:
             _get(base + "/nope")
         assert e.value.code == 404
-        # Concurrent requests do not trip each other up.
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base + "/nope")
+        assert e.value.code == 404
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base + "/analyze", b"{not json")
+        assert e.value.code == 500
+        # Concurrent clients do not trip each other up (the default listen
+        # backlog of 5 reset connections here).
         errors = []
 
         def hit():
             try:
                 for _ in range(10):
                     json.loads(_get(base + "/json")[2])
+                    _post(base + "/analyze", json.dumps(first["snapshot"]).encode())
             except Exception as ex:  # pragma: no cover - reported below
                 errors.append(ex)
 
@@ -202,21 +248,47 @@ def test_http_server_serves_dashboard_json_and_metrics():
         server.server_close()
 
 
-def test_top_and_dump_commands_against_a_live_server():
+def test_top_profile_and_dump_commands_against_a_live_server():
     tok = _tiny()
     server = obs.serve({"tiny": tok}, port=0)
+    stop = threading.Event()
+
+    def load():
+        while not stop.is_set():
+            tok.encode("end<end>end")
+            time.sleep(0.001)
+
+    loader = threading.Thread(target=load, name="obs-cli-load")
+    loader.start()
     try:
         host, port = server.server_address[:2]
         url = f"http://{host}:{port}"
-        top = subprocess.run([sys.executable, "-m", "fastokens.observe", "top", "--url", url, "--once", "--interval", "0.2"],
-                             capture_output=True, text=True, timeout=60)
+
+        def run(*args):
+            return subprocess.run([sys.executable, "-m", "fastokens.observe", *args, "--url", url],
+                                  capture_output=True, text=True, timeout=60)
+
+        top = run("top", "--once", "--interval", "0.3")
         assert top.returncode == 0, top.stderr
-        assert ("API" in top.stdout) if ENABLED else ("observe" in top.stdout)
-        dump = subprocess.run([sys.executable, "-m", "fastokens.observe", "dump", "--url", url],
-                              capture_output=True, text=True, timeout=60)
+        prof = run("profile", "--seconds", "0.5")
+        assert prof.returncode == 0, prof.stderr
+        prof_json = run("profile", "--seconds", "0.5", "--json")
+        assert prof_json.returncode == 0, prof_json.stderr
+        data = json.loads(prof_json.stdout)
+        assert data["enabled"] is ENABLED
+        if ENABLED:
+            assert "where encode time goes" in top.stdout
+            assert "where encode time goes" in prof.stdout and "slowest encodes" in prof.stdout
+            assert data["encodes"]["total"] > 0
+            assert data["slowest"] and all(s["thread"] == "py:obs-cli-load" for s in data["slowest"])
+        else:
+            assert "observe" in top.stdout
+        dump = run("dump")
         assert dump.returncode == 0, dump.stderr
         assert json.loads(dump.stdout)["process"]["enabled"] is ENABLED
     finally:
+        stop.set()
+        loader.join()
         server.shutdown()
         server.server_close()
 
@@ -245,34 +317,39 @@ def test_api_and_encode_counts_are_exact_per_thread(qwen):
     ids = qwen.encode(big).ids
 
     def work():
+        n_tokens = 0
         for _ in range(3):
-            qwen.encode(small)
-        qwen.encode(big)
-        qwen.encode_ordinary(small)
+            n_tokens += len(qwen.encode(small))
+        n_tokens += len(qwen.encode(big))
+        n_tokens += len(qwen.encode_ordinary(small))
         # Two inputs each: rayon runs a one-input batch inline on the caller.
         qwen.encode_batch([small, big])
         qwen.encode_batch_flat([small, small])
         qwen.decode(ids)
         qwen.decode_batch([ids, ids[:10]])
+        return n_tokens
 
     a = obs.snapshot()
-    _in_thread("obs-exact", work)
+    n_tokens = _in_thread("obs-exact", work)
     b = obs.snapshot()
     me = _slot(b, "py:obs-exact")
     assert me["alive"] is False
     assert me["api_calls"] == 9
-    # encode, encode_ordinary run here; the batches run on rayon's pool.
+    # encode and encode_ordinary run here; the batches run on rayon's pool.
     assert me["encodes"] == 5
     assert me["encode_bytes"] == 4 * len(small.encode()) + len(big.encode())
+    assert me["encode_tokens"] == n_tokens
     api = lambda s, k, f: s["process"]["api"][k][f]
     d = lambda k, f: api(b, k, f) - api(a, k, f)
     assert d("encode", "calls") == 4
     assert d("encode", "gil_released") == 1  # only the >= 16 KB input
     assert d("encode", "units") == 3 * len(small.encode()) + len(big.encode())
+    assert 0 < d("encode", "rust_ns") <= d("encode", "ns")
     assert d("encode_ordinary", "calls") == 1
     assert d("encode_batch", "calls") == 1 and d("encode_batch", "gil_released") == 1
     assert d("encode_batch_flat", "calls") == 1
     assert d("decode", "calls") == 1 and d("decode", "units") == len(ids)
+    assert 0 < d("decode", "rust_ns") <= d("decode", "ns")
     assert d("decode_batch", "units") == len(ids) + 10
     assert sum(me["paths"].values()) == 5
     if json.loads(qwen.observe())["scanner_path"]:
@@ -282,6 +359,145 @@ def test_api_and_encode_counts_are_exact_per_thread(qwen):
     jobs = lambda s: s["process"]["jobs"]["batch"]
     assert jobs(b)["jobs"] - jobs(a)["jobs"] == 2
     assert jobs(b)["tasks"] - jobs(a)["tasks"] == 4
+
+
+@needs_observe
+def test_reading_encoding_lists_is_counted(qwen):
+    enc = qwen.encode(_chat(3, seed=9))
+    a = obs.snapshot()["process"]["api"]
+    ids = enc.ids
+    mask = enc.attention_mask
+    b = obs.snapshot()["process"]["api"]
+    assert b["encoding_ids"]["calls"] - a["encoding_ids"]["calls"] == 1
+    assert b["encoding_ids"]["units"] - a["encoding_ids"]["units"] == len(ids)
+    assert b["encoding_lists"]["calls"] - a["encoding_lists"]["calls"] == 1
+    assert b["encoding_lists"]["units"] - a["encoding_lists"]["units"] == len(mask)
+
+
+@needs_observe
+def test_profile_breaks_encodes_into_stages(tmp_path, qwen):
+    scan = _scanner(tmp_path)
+    chats = [_chat(6, seed=s) for s in range(5)]
+    tokens = 0
+    with obs.profile({"scan": scan, "qwen": qwen}) as p:
+        for c in chats:
+            tokens += len(scan.encode(c).ids)
+            tokens += len(qwen.encode(c).ids)
+    a = p.data
+    assert a["encodes"]["total"] == 10
+    assert sum(x["tokens"] for x in a["paths"].values()) == tokens
+    assert sum(x["bytes"] for x in a["paths"].values()) == 2 * sum(len(c.encode()) for c in chats)
+    s = a["paths"]["scan_splits"]
+    assert s["encodes"] == 5
+    assert s["stage_ms"]["added_tokens"] > 0 and s["stage_ms"]["model"] > 0
+    assert s["stage_ms"]["pretokenize"] == 0  # fused into the scan
+    q = a["paths"]["fused_split"]
+    assert q["stage_ms"]["pretokenize"] > 0 and q["stage_ms"]["model"] > 0
+    for path in a["paths"].values():
+        assert sum(path["stage_ms"].values()) <= path["mean_ms"] * (1 + 1e-9)
+        assert path["other_ms"] >= 0
+        assert path["bytes_per_token"] > 0
+    # Every encode is among the slowest kept (fewer than 32 ran).
+    assert len(a["slowest"]) == 10
+    ns = [x["ns"] for x in a["slowest"]]
+    assert ns == sorted(ns, reverse=True)
+    assert all(sum(x["stage_ns"].values()) <= x["ns"] for x in a["slowest"])
+    text = p.report()
+    assert "where encode time goes" in text and "scan_splits" in text and "fused_split" in text
+    assert "slowest encodes" in text and "BPE pretoken cache" in text
+
+
+@needs_observe
+def test_bpe_cache_hits_on_a_repeat(tmp_path):
+    scan = _scanner(tmp_path)
+    text = " ".join(f"word{i}" for i in range(2000))  # under 64 KiB: runs here
+    with obs.profile() as first:
+        scan.encode(text)
+    with obs.profile() as second:
+        scan.encode(text)
+    f1, f2 = first.data["bpe"]["fused"], second.data["bpe"]["fused"]
+    assert f1["lookups"] == f2["lookups"] >= 2000
+    assert f1["misses"] > 0 and f1["merge_ms"] > 0
+    assert f2["misses"] == 0 and f2["hit_rate"] == 1.0
+    long_word = "x" * 64
+    with obs.profile() as third:
+        scan.encode(long_word)
+        scan.encode(long_word)
+    f3 = third.data["bpe"]["fused"]
+    assert f3["misses"] == f3["uncacheable"] == 2  # no inline key: merged each time
+
+
+@needs_observe
+def test_prefix_cache_reuse_is_counted(tmp_path):
+    tok = _scanner(tmp_path, FASTOKENS_INPUT_CACHE=4)
+    plain = _scanner(tmp_path)
+    base = "".join(f"line {i}: hello the thing\n" for i in range(1500))
+    longer = base + "hello the end\n"
+    with obs.profile({"t": tok}) as p:
+        for text in (base, base, longer):
+            assert tok.encode(text).ids == plain.encode(text).ids
+    pc = p.data["tokenizers"]["t"]["prefix_cache"]
+    assert (pc["lookups"], pc["exact_hits"], pc["prefix_hits"], pc["misses"]) == (3, 1, 1, 1)
+    assert pc["reused_tokens"] >= 256
+    assert 0.5 < pc["reused_share"] < 1
+    assert p.data["paths"]["scan_whole"]["stage_ms"]["prefix_cache"] > 0
+    assert "prefix cache [t]" in p.report()
+
+
+@needs_observe
+def test_segment_cache_counters_follow_the_traffic():
+    tok = _with_env("FASTOKENS_SEGMENT_CACHE", 64, lambda: Tokenizer.from_model(MODEL))
+    chat = _chat(20, seed=4)
+    first = tok.encode(chat).ids
+    c1 = json.loads(tok.observe())["segment_cache"]
+    with obs.profile({"q": tok}) as p:
+        second = tok.encode(chat).ids
+    c2 = json.loads(tok.observe())["segment_cache"]
+    assert first == second
+    # The text segments between added tokens: the first request looks up each
+    # distinct one once (a repeat within it reuses that lookup) and misses;
+    # the second looks up every occurrence and hits.
+    segs = [s.encode() for s in re.split(r"<\|im_start\|>|<\|im_end\|>", chat) if s]
+    distinct = set(segs)
+    assert (c1["hits"], c1["misses"]) == (0, len(distinct))
+    assert c1["miss_bytes"] == sum(map(len, distinct))
+    assert (c2["hits"], c2["misses"]) == (len(segs), len(distinct))
+    assert c2["hit_bytes"] == sum(map(len, segs))
+    assert c2["entries"] == len(distinct) and len(c2["shards"]) == c2["shard_count"] == 16
+    assert sum(s["inserts"] for s in c2["shards"]) == len(distinct) - c2["rejected_too_large"]
+    seg = p.data["tokenizers"]["q"]["segment_cache"]
+    assert seg["hit_rate"] == 1.0 and seg["byte_hit_rate"] == 1.0
+    assert seg["miss_tokenize_ms"] == 0 and seg["est_saved_ms"] is None  # no misses to price hits by
+    stages = p.data["paths"]["segments_cached"]["stage_ms"]
+    assert stages["cache_lookup"] > 0 and stages["model"] == 0  # all hits: no model work
+    me_paths = _in_thread("obs-cache", lambda: (tok.encode(chat), obs.snapshot())[1])
+    assert _slot(me_paths, "py:obs-cache")["paths"]["segments_cached"] == 1
+
+
+@needs_observe
+def test_segment_cache_saving_is_estimated_from_misses():
+    tok = _with_env("FASTOKENS_SEGMENT_CACHE", 64, lambda: Tokenizer.from_model(MODEL))
+    with obs.profile({"q": tok}) as p:
+        for seed in range(5):
+            tok.encode(_chat(10, seed=200 + seed))
+            tok.encode(_chat(10, seed=200 + seed))
+    seg = p.data["tokenizers"]["q"]["segment_cache"]
+    assert 0 < seg["hit_rate"] < 1
+    assert seg["miss_tokenize_ms"] > 0 and seg["est_saved_ms"] > 0
+
+
+@needs_observe
+def test_a_small_cache_rotates_and_evicts():
+    tok = _with_env("FASTOKENS_SEGMENT_CACHE", 1, lambda: Tokenizer.from_model(MODEL))
+    for seed in range(60):
+        tok.encode(_chat(10, seed=100 + seed, body=150))
+    c = json.loads(tok.observe())["segment_cache"]
+    rot = sum(s["rotations"] for s in c["shards"])
+    ev = sum(s["evicted_entries"] for s in c["shards"])
+    assert rot > 0 and ev > 0
+    assert c["bytes"] <= c["approx_max_bytes"] * 1.5
+    assert sum(s["young_entries"] + s["old_entries"] for s in c["shards"]) == c["entries"]
+    assert sum(s["young_bytes"] + s["old_bytes"] for s in c["shards"]) == c["bytes"]
 
 
 @needs_observe
@@ -304,74 +520,24 @@ def test_gil_wait_is_counted_when_python_holds_the_gil(qwen):
 
 
 @needs_observe
-def test_threads_are_named_and_marked_dead():
-    tok = _tiny()
-    _in_thread("obs-named", lambda: tok.encode("end"))
-    me = _slot(obs.snapshot(), "py:obs-named")
-    assert me["kind"] == "caller"
-    assert me["alive"] is False
-    assert me["os_tid"] > 0
-    assert me["encodes"] == 1 and me["api_calls"] == 1
-
-
-@needs_observe
 def test_long_inputs_run_pool_jobs_on_named_workers(qwen):
     p = obs.snapshot()["process"]
     if p["pool"]["bpe_threads"] < 2:
         pytest.skip("single-threaded BPE pool")
-    a = obs.snapshot()
-    qwen.encode(_chat(2000, seed=3))  # several hundred KB of chat template
-    plain = "".join(f"line {i}: the quick brown fox\n" for i in range(20_000))
-    qwen.encode(plain)
-    b = obs.snapshot()
-    jobs = lambda s, k: s["process"]["jobs"][k]["jobs"]
+    with obs.profile({"q": qwen}) as prof:
+        qwen.encode(_chat(2000, seed=3))  # several hundred KB of chat template
+        plain = "".join(f"line {i}: the quick brown fox\n" for i in range(20_000))
+        qwen.encode(plain)
+    jobs = prof.data["jobs"]
     if json.loads(qwen.observe())["scanner_path"]:
-        assert jobs(b, "chat_splits") > jobs(a, "chat_splits")
-        assert jobs(b, "scan") > jobs(a, "scan")
+        assert jobs["chat_splits"]["jobs"] >= 1 and jobs["scan"]["jobs"] >= 1
     else:  # Split fused with the model: the splits are tokenized in parallel
-        assert jobs(b, "pretokenized") >= jobs(a, "pretokenized") + 2
-    workers = [t for t in b["process"]["threads"] if t["name"].startswith("fastokens-")]
+        assert jobs["pretokenized"]["jobs"] >= 2
+    # Tasks ran and were timed; how many ran at once depends on free cores.
+    assert all(j["parallelism"] and j["parallelism"] > 0 for j in jobs.values())
+    workers = [t for t in prof.after["process"]["threads"] if t["name"].startswith("fastokens-")]
     assert workers and all(t["kind"] == "worker" for t in workers)
     assert sum(t["tasks"] for t in workers) > 0
-
-
-@needs_observe
-def test_segment_cache_counters_follow_the_traffic():
-    tok = _qwen_with_cache(64)
-    chat = _chat(20, seed=4)
-    first = tok.encode(chat).ids
-    c1 = json.loads(tok.observe())["segment_cache"]
-    second = tok.encode(chat).ids
-    c2 = json.loads(tok.observe())["segment_cache"]
-    assert first == second
-    # The text segments between added tokens: the first request looks up each
-    # distinct one once (a repeat within it reuses that lookup) and misses;
-    # the second looks up every occurrence and hits.
-    segs = [s.encode() for s in re.split(r"<\|im_start\|>|<\|im_end\|>", chat) if s]
-    distinct = set(segs)
-    assert (c1["hits"], c1["misses"]) == (0, len(distinct))
-    assert c1["miss_bytes"] == sum(map(len, distinct))
-    assert (c2["hits"], c2["misses"]) == (len(segs), len(distinct))
-    assert c2["hit_bytes"] == sum(map(len, segs))
-    assert c2["entries"] == len(distinct) and len(c2["shards"]) == c2["shard_count"] == 16
-    assert sum(s["inserts"] for s in c2["shards"]) == len(distinct) - c2["rejected_too_large"]
-    me_paths = _in_thread("obs-cache", lambda: (tok.encode(chat), obs.snapshot())[1])
-    assert _slot(me_paths, "py:obs-cache")["paths"]["segments_cached"] == 1
-
-
-@needs_observe
-def test_a_small_cache_rotates_and_evicts():
-    tok = _qwen_with_cache(1)  # 1 MiB: 32 KiB per shard's young generation
-    for seed in range(60):
-        tok.encode(_chat(10, seed=100 + seed, body=150))
-    c = json.loads(tok.observe())["segment_cache"]
-    rot = sum(s["rotations"] for s in c["shards"])
-    ev = sum(s["evicted_entries"] for s in c["shards"])
-    assert rot > 0 and ev > 0
-    assert c["bytes"] <= c["approx_max_bytes"] * 1.5
-    # Shards report generations that add up to the totals.
-    assert sum(s["young_entries"] + s["old_entries"] for s in c["shards"]) == c["entries"]
-    assert sum(s["young_bytes"] + s["old_bytes"] for s in c["shards"]) == c["bytes"]
 
 
 @needs_observe
@@ -433,7 +599,7 @@ def test_counters_never_decrease_while_threads_work(qwen):
 def _assert_monotonic(a, b, at):
     if isinstance(a, dict):
         for k, v in a.items():
-            if k in ("alive", "kind", "name"):
+            if k in ("alive", "kind", "name", "slowest", "stages"):
                 continue
             _assert_monotonic(v, b[k], f"{at}.{k}")
     elif isinstance(a, list):
@@ -456,6 +622,11 @@ def test_prometheus_values_match_the_snapshot(qwen):
     p = snap["process"]
     assert samples[("fastokens_api_calls_total", (("api", "encode"),))] == p["api"]["encode"]["calls"]
     assert samples[("fastokens_jobs_total", (("kind", "batch"),))] == p["jobs"]["batch"]["jobs"]
+    assert samples[("fastokens_bpe_fused_lookups_total", ())] == p["bpe"]["fused_lookups"]
+    path = "fused_split"
+    assert samples[("fastokens_encode_tokens_total", (("path", path),))] == p["paths"][path]["tokens"]
+    stage = samples[("fastokens_encode_stage_seconds_total", (("path", path), ("stage", "model")))]
+    assert stage == pytest.approx(p["paths"][path]["stage_ns"]["model"] / 1e9)
     count = samples[("fastokens_api_latency_seconds_count", (("api", "encode"),))]
     inf = samples[("fastokens_api_latency_seconds_bucket", (("api", "encode"), ("le", "+Inf")))]
     assert count == inf == p["api"]["encode"]["calls"]

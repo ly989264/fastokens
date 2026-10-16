@@ -188,7 +188,8 @@ impl PreTokenizedString {
             let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
                 .into_par_iter()
                 .map(|job_index| {
-                    let _task = crate::observe::TaskGuard::start();
+                    let _task =
+                        crate::observe::TaskGuard::start(crate::observe::JobKind::Pretokenized);
                     let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
                     let mut ids = Vec::with_capacity(chunk.len() * 3);
                     for split in chunk {
@@ -238,7 +239,8 @@ impl PreTokenizedString {
             let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
                 .into_par_iter()
                 .map(|job_index| {
-                    let _task = crate::observe::TaskGuard::start();
+                    let _task =
+                        crate::observe::TaskGuard::start(crate::observe::JobKind::Pretokenized);
                     let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
                     let mut ids = Vec::with_capacity(chunk.len() * 3);
                     tokenize_fn(&self.buffer, chunk, &mut ids)?;
@@ -320,7 +322,7 @@ where
         let parts: Result<Vec<Vec<u32>>, String> = segments
             .par_iter()
             .map(|&(s, e)| {
-                let _task = crate::observe::TaskGuard::start();
+                let _task = crate::observe::TaskGuard::start(crate::observe::JobKind::Scan);
                 per_chunk(&buffer[s..e])
             })
             .collect();
@@ -422,7 +424,7 @@ where
         let parts: Result<Vec<Vec<u32>>, String> = jobs
             .par_iter()
             .map(|(range, bytes)| {
-                let _task = crate::observe::TaskGuard::start();
+                let _task = crate::observe::TaskGuard::start(crate::observe::JobKind::ScanSplits);
                 let mut ids = Vec::with_capacity(bytes / 3 + range.len());
                 run(&items[range.clone()], &mut ids)?;
                 Ok(ids)
@@ -474,7 +476,7 @@ where
         let parts: Result<Vec<IdsWithBounds>, String> = segments
             .par_iter()
             .map(|&(s, e)| {
-                let _task = crate::observe::TaskGuard::start();
+                let _task = crate::observe::TaskGuard::start(crate::observe::JobKind::Scan);
                 per_chunk(&buffer[s..e])
             })
             .collect();

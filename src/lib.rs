@@ -366,6 +366,22 @@ struct InputCache {
     capacity: usize,
     /// Most-recent-first LRU of cached encodings.
     entries: VecDeque<PrefixEntry>,
+    #[cfg(feature = "observe")]
+    obs: PrefixObs,
+}
+
+/// [`InputCache`]'s [`observe`] counters: lookups, which ended as an exact
+/// repeat, a reused prefix or nothing, and how many bytes and tokens of
+/// inputs the reuses covered.
+#[cfg(feature = "observe")]
+#[derive(Default)]
+struct PrefixObs {
+    lookups: u64,
+    exact: u64,
+    prefix: u64,
+    reused_bytes: u64,
+    reused_tokens: u64,
+    lookup_bytes: u64,
 }
 
 /// Longest common byte prefix of `a` and `b`, compared 8 bytes at a time.
@@ -400,7 +416,53 @@ impl InputCache {
         Self {
             capacity: capacity.max(1),
             entries: VecDeque::new(),
+            #[cfg(feature = "observe")]
+            obs: PrefixObs::default(),
         }
+    }
+
+    /// [`Self::reuse_plan`], counted for [`observe`].
+    #[inline]
+    fn reuse_plan_counted(&mut self, input: &[u8]) -> Option<Reuse> {
+        let plan = self.reuse_plan(input);
+        #[cfg(feature = "observe")]
+        {
+            let o = &mut self.obs;
+            o.lookups += 1;
+            o.lookup_bytes += input.len() as u64;
+            if let Some(r) = &plan {
+                if r.tail_start == input.len() {
+                    o.exact += 1;
+                } else {
+                    o.prefix += 1;
+                }
+                o.reused_bytes += r.tail_start as u64;
+                o.reused_tokens += r.tokens as u64;
+            }
+        }
+        plan
+    }
+
+    /// The cache's size and, with the `observe` feature, its counters.
+    fn observe_json(&self) -> serde_json::Value {
+        #[allow(unused_mut)]
+        let mut v = serde_json::json!({
+            "capacity": self.capacity,
+            "entries": self.entries.len(),
+            "bytes": self.entries.iter().map(|e| e.buf.len() + e.core_ids.len() * 4).sum::<usize>(),
+        });
+        #[cfg(feature = "observe")]
+        {
+            let o = &self.obs;
+            v["lookups"] = o.lookups.into();
+            v["exact_hits"] = o.exact.into();
+            v["prefix_hits"] = o.prefix.into();
+            v["misses"] = (o.lookups - o.exact - o.prefix).into();
+            v["lookup_bytes"] = o.lookup_bytes.into();
+            v["reused_bytes"] = o.reused_bytes.into();
+            v["reused_tokens"] = o.reused_tokens.into();
+        }
+        v
     }
 
     /// Drop every cached encoding. Required whenever the vocabulary changes,
@@ -1098,7 +1160,7 @@ impl Tokenizer {
         serde_json::json!({
             "enabled": observe::ENABLED,
             "scanner_path": scanner_path,
-            "prefix_cache": self.input_cache.is_some(),
+            "prefix_cache": self.input_cache.as_ref().map(|c| c.lock().unwrap().observe_json()),
             "segment_cache": self.segment_cache.as_ref().map(SegmentCache::observe_json),
         })
     }
@@ -1195,6 +1257,7 @@ impl Tokenizer {
             };
         }
         let timer = observe::Timer::start();
+        observe::begin_encode();
 
         // 1. Normalize the input, optionally recognizing added vocabulary.
         let pts = match policy {
@@ -1213,10 +1276,14 @@ impl Tokenizer {
             }
             _ => self.tokenize_pre_tokenized(pts, true)?,
         };
-        observe::encode_done(input.len(), timer.ns());
 
         // 4. Post-process.
-        Ok(self.post_process(ids, add_special_tokens))
+        let ids = {
+            let _stage = observe::stage(observe::Stage::PostProcess);
+            self.post_process(ids, add_special_tokens)
+        };
+        observe::encode_done(input.len(), ids.len(), timer.ns());
+        Ok(ids)
     }
 
     /// Pre-tokenize and tokenize a normalized, added-token-split input,
@@ -1253,8 +1320,12 @@ impl Tokenizer {
                 // Prefix cache: reuse the leading ids shared with a cached input
                 // and tokenize only the tail, or reuse an exact repeat wholesale.
                 if use_input_cache && let Some(cache) = &self.input_cache {
-                    let plan = cache.lock().unwrap().reuse_plan(buffer.as_bytes());
+                    let plan = {
+                        let _stage = observe::stage(observe::Stage::PrefixCache);
+                        cache.lock().unwrap().reuse_plan_counted(buffer.as_bytes())
+                    };
                     if let Some(r) = plan {
+                        let _stage = observe::stage(observe::Stage::Model);
                         let mut ids =
                             Vec::with_capacity(r.tokens + (buffer.len() - r.tail_start) / 3 + 1);
                         ids.extend_from_slice(&r.core_ids[..r.tokens]);
@@ -1270,6 +1341,7 @@ impl Tokenizer {
                         return Ok(ids);
                     }
                     // Miss: full encode recording reuse boundaries, then cache it.
+                    let model_stage = observe::stage(observe::Stage::Model);
                     let scan_seg_rec = |seg: &str| {
                         let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
                         let mut b = Vec::new();
@@ -1283,6 +1355,8 @@ impl Tokenizer {
                         scan_seg_rec,
                     )
                     .map_err(Error::Model)?;
+                    model_stage.end();
+                    let _stage = observe::stage(observe::Stage::PrefixCache);
                     cache
                         .lock()
                         .unwrap()
@@ -1290,6 +1364,7 @@ impl Tokenizer {
                     return Ok(ids);
                 }
 
+                let _stage = observe::stage(observe::Stage::Model);
                 let ids = crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg)
                     .map_err(Error::Model)?;
                 return Ok(ids);
@@ -1304,6 +1379,7 @@ impl Tokenizer {
                 && let Some(kind) = inner.scan_kind()
             {
                 observe::set_path(observe::Path::ScanSplits);
+                let _stage = observe::stage(observe::Stage::Model);
                 let ids = crate::pre_tokenized::tokenize_scanned_splits(&pts, kind, |text, out| {
                     self.model.tokenize_scanned_segment(kind, text, out)
                 })
@@ -1312,7 +1388,11 @@ impl Tokenizer {
             }
 
             observe::set_path(observe::Path::FusedSplit);
-            split.pre_tokenize(&mut pts)?;
+            {
+                let _stage = observe::stage(observe::Stage::Pretokenize);
+                split.pre_tokenize(&mut pts)?;
+            }
+            let _stage = observe::stage(observe::Stage::Model);
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {
                     self.model.tokenize_batch_fused(buf, splits, out)
@@ -1322,6 +1402,7 @@ impl Tokenizer {
         }
 
         observe::set_path(observe::Path::General);
+        let pretokenize_stage = observe::stage(observe::Stage::Pretokenize);
         // 2. Pre-tokenize (refine splits in place).
         if let Some(ref pt) = self.pre_tokenizer {
             pt.pre_tokenize(&mut pts)?;
@@ -1337,8 +1418,10 @@ impl Tokenizer {
         {
             split_on_unbridgeable_bigrams(&mut pts, table);
         }
+        pretokenize_stage.end();
 
         // 3. Tokenize each text split with the model.
+        let _stage = observe::stage(observe::Stage::Model);
         pts.tokenize(|text, out| self.model.tokenize_into(text, out))
             .map_err(Error::Model)
     }
@@ -1362,6 +1445,7 @@ impl Tokenizer {
             Miss(usize),
         }
 
+        let lookup_stage = observe::stage(observe::Stage::CacheLookup);
         let buffer = pts.buffer();
         let mut pieces = Vec::with_capacity(pts.splits().len());
         // Distinct missed segments as (hash, text); repeats within this input
@@ -1391,9 +1475,14 @@ impl Tokenizer {
             }
         }
 
+        lookup_stage.end();
+
         let timer = observe::Timer::start();
         let miss_ids = self.tokenize_misses(&misses)?;
-        cache.record_miss_tokenize(timer.ns());
+        if !misses.is_empty() {
+            cache.record_miss_tokenize(timer.ns());
+        }
+        let _stage = observe::stage(observe::Stage::CacheAssemble);
         for ((hash, text), ids) in misses.iter().zip(&miss_ids) {
             cache.insert(*hash, text.as_bytes(), ids);
         }
@@ -1472,7 +1561,7 @@ impl Tokenizer {
         inputs
             .par_iter()
             .map(|input| {
-                let _task = observe::TaskGuard::start();
+                let _task = observe::TaskGuard::start(observe::JobKind::Batch);
                 self.encode_with_special_tokens(input.as_ref(), add_special_tokens)
             })
             .collect()
@@ -1621,9 +1710,12 @@ impl Tokenizer {
     /// [`Self::build_pre_tokenized`], optionally leaving special tokens as
     /// ordinary text (see [`AddedTokens::split_with`]).
     pub fn build_pre_tokenized_with(&self, input: &str, skip_special: bool) -> PreTokenizedString {
-        let segments = match &self.added_tokens {
-            Some(at) => at.split_with(input, skip_special),
-            None => vec![Segment::Text(input)],
+        let segments = {
+            let _stage = observe::stage(observe::Stage::AddedTokens);
+            match &self.added_tokens {
+                Some(at) => at.split_with(input, skip_special),
+                None => vec![Segment::Text(input)],
+            }
         };
 
         // Fast path: if there's exactly one Text segment (no added token matches)
@@ -1651,7 +1743,10 @@ impl Tokenizer {
                         continue;
                     }
                     let normalized = match &self.normalizer {
-                        Some(n) => n.normalize(text),
+                        Some(n) => {
+                            let _stage = observe::stage(observe::Stage::Normalize);
+                            n.normalize(text)
+                        }
                         None => std::borrow::Cow::Borrowed(*text),
                     };
                     let start = buffer.len();
@@ -1671,7 +1766,10 @@ impl Tokenizer {
     /// Normalize one input as a single text span, bypassing added vocabulary.
     fn build_pre_tokenized_ordinary(&self, input: &str) -> PreTokenizedString {
         let normalized = match &self.normalizer {
-            Some(normalizer) => normalizer.normalize(input),
+            Some(normalizer) => {
+                let _stage = observe::stage(observe::Stage::Normalize);
+                normalizer.normalize(input)
+            }
             None => std::borrow::Cow::Borrowed(input),
         };
         match normalized {
@@ -2654,7 +2752,7 @@ mod local_tests {
             assert_eq!(first, second);
             assert_eq!(a["enabled"], true);
             assert_eq!(a["scanner_path"], true);
-            assert_eq!(a["prefix_cache"], false);
+            assert!(a["prefix_cache"].is_null());
             let c = |v: &Value, k: &str| n(v, &["segment_cache", k]);
             // Text segments of CHAT: "user\nHello there", "assistant\nthe thing".
             assert_eq!((c(&a, "hits"), c(&a, "misses")), (0, 2));
@@ -2662,6 +2760,8 @@ mod local_tests {
             assert_eq!(c(&b, "hit_bytes"), c(&a, "miss_bytes"));
             assert_eq!(c(&b, "entries"), 2);
             assert!(c(&b, "miss_tokenize_ns") > 0);
+            // All hits: no miss tokenizing is timed.
+            assert_eq!(c(&b, "miss_tokenize_ns"), c(&a, "miss_tokenize_ns"));
             let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
             assert!(plain.observe_json()["segment_cache"].is_null());
         }
@@ -2704,6 +2804,137 @@ mod local_tests {
             assert!(after["threads"].as_array().unwrap().iter().any(|t| {
                 t["name"].as_str().unwrap().starts_with("rayon-") && t["kind"] == "worker"
             }));
+        }
+
+        /// `me`'s counter at `path` minus `before`'s.
+        fn d(me: &Value, before: &Value, path: &[&str]) -> u64 {
+            n(me, path) - n(before, path)
+        }
+
+        #[test]
+        fn stages_land_on_the_path_that_ran_them() {
+            on_fresh_thread(|| {
+                let tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                let a = observe::current_thread();
+                tok.encode(CHAT).unwrap();
+                let b = observe::current_thread();
+                let st = |k: &str| d(&b, &a, &["stage_ns", k]);
+                assert!(st("added_tokens") > 0 && st("model") > 0, "{b}");
+                assert_eq!(
+                    st("cache_lookup") + st("cache_assemble") + st("prefix_cache"),
+                    0
+                );
+                let total: u64 = STAGES_FOR_TEST.iter().map(|k| st(k)).sum();
+                assert!(total <= d(&b, &a, &["encode_ns"]), "{total} > encode");
+
+                let mut cached = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                cached.enable_segment_cache(1 << 20);
+                cached.encode(CHAT).unwrap();
+                let c = observe::current_thread();
+                assert!(d(&c, &b, &["stage_ns", "cache_lookup"]) > 0);
+                assert!(
+                    d(&c, &b, &["stage_ns", "model"]) > 0,
+                    "misses are tokenized"
+                );
+                cached.encode(CHAT).unwrap();
+                let e = observe::current_thread();
+                assert!(d(&e, &c, &["stage_ns", "cache_lookup"]) > 0);
+                assert_eq!(
+                    d(&e, &c, &["stage_ns", "model"]),
+                    0,
+                    "all hits: no model work"
+                );
+                assert_eq!(d(&e, &c, &["paths", "segments_cached"]), 1);
+
+                let normalized = segment_test_tokenizer(
+                    json!({"type": "NFC"}),
+                    json!({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}),
+                );
+                let text = "the thing in the ring ".repeat(500);
+                let f = observe::current_thread();
+                normalized.encode(&text).unwrap();
+                let g = observe::current_thread();
+                assert!(d(&g, &f, &["stage_ns", "normalize"]) > 0);
+                assert!(d(&g, &f, &["stage_ns", "model"]) > 0);
+            });
+        }
+
+        const STAGES_FOR_TEST: [&str; 8] = [
+            "added_tokens",
+            "normalize",
+            "prefix_cache",
+            "pretokenize",
+            "model",
+            "cache_lookup",
+            "cache_assemble",
+            "post_process",
+        ];
+
+        #[test]
+        fn bpe_cache_counters_follow_the_work() {
+            on_fresh_thread(|| {
+                let tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                // Under 64 KiB, so it all runs on this thread.
+                let text = (0..400).map(|i| format!("word{i} ")).collect::<String>();
+                let a = observe::current_thread();
+                let first = tok.encode(&text).unwrap();
+                let b = observe::current_thread();
+                let second = tok.encode(&text).unwrap();
+                let c = observe::current_thread();
+                assert_eq!(first, second);
+                let first_lookups = d(&b, &a, &["bpe", "fused_lookups"]);
+                assert!(first_lookups >= 400, "{b}");
+                assert!(d(&b, &a, &["bpe", "fused_misses"]) > 0);
+                assert!(d(&b, &a, &["bpe", "fused_misses"]) <= first_lookups);
+                assert!(d(&b, &a, &["bpe", "fused_merge_ns"]) > 0);
+                // The same pretokens again, all in this thread's cache now.
+                assert_eq!(d(&c, &b, &["bpe", "fused_lookups"]), first_lookups);
+                assert_eq!(d(&c, &b, &["bpe", "fused_misses"]), 0);
+                assert_eq!(d(&c, &b, &["bpe", "fused_merge_ns"]), 0);
+
+                // A pretoken over 15 bytes has no inline key: merged every time.
+                let long = "a".repeat(40);
+                tok.encode(&long).unwrap();
+                let e = observe::current_thread();
+                tok.encode(&long).unwrap();
+                let f = observe::current_thread();
+                assert_eq!(d(&f, &e, &["bpe", "fused_misses"]), 1);
+                assert_eq!(d(&f, &e, &["bpe", "fused_uncacheable"]), 1);
+                assert_eq!(d(&f, &e, &["bpe", "fused_miss_bytes"]), 40);
+            });
+        }
+
+        #[test]
+        fn prefix_cache_counts_repeats_reuse_and_misses() {
+            on_fresh_thread(|| {
+                let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                tok.enable_input_cache(4);
+                let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                let base: String = (0..1500)
+                    .map(|i| format!("line {i}: the thing\n"))
+                    .collect();
+                let longer = format!("{base}Hello the end\n");
+                for text in [&base, &base, &longer] {
+                    assert_eq!(tok.encode(text).unwrap(), plain.encode(text).unwrap());
+                }
+                let p = &tok.observe_json()["prefix_cache"];
+                assert_eq!(n(p, &["lookups"]), 3);
+                assert_eq!(n(p, &["misses"]), 1);
+                assert_eq!(n(p, &["exact_hits"]), 1);
+                assert_eq!(n(p, &["prefix_hits"]), 1);
+                assert!(n(p, &["reused_tokens"]) >= 256);
+                // The exact repeat reused all of `base`, the prefix hit nearly all.
+                assert!(n(p, &["reused_bytes"]) > base.len() as u64);
+                assert_eq!(
+                    n(p, &["lookup_bytes"]),
+                    (2 * base.len() + longer.len()) as u64
+                );
+                // Only the miss stores an encoding.
+                assert_eq!(n(p, &["entries"]), 1);
+                let me = observe::current_thread();
+                assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
+                assert!(plain.observe_json()["prefix_cache"].is_null());
+            });
         }
     }
 }

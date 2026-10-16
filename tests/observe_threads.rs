@@ -10,7 +10,7 @@ fn more_threads_than_slots_share_the_last_one() {
     for i in 0..threads {
         std::thread::Builder::new()
             .name(format!("many-{i}"))
-            .spawn(|| api_call(Api::Decode, 1, 1, false, 0))
+            .spawn(|| api_call(Api::Decode, 1, 1, 1, false, 0))
             .unwrap()
             .join()
             .unwrap();

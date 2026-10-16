@@ -245,3 +245,7 @@ def observe_snapshot() -> str:
 def observe_enabled() -> bool:
     """Whether this build has the `observe` feature."""
     ...
+
+def observe_reset_slow() -> None:
+    """Forget the slowest encodes kept so far (start a fresh profile window)."""
+    ...
