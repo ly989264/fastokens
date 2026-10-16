@@ -524,6 +524,77 @@ impl From<PyNewToken> for fastokens::NewToken {
 /// well under a millisecond, less than a contended GIL hand-off can cost.
 const RELEASE_GIL_MIN_BYTES: usize = 16 * 1024;
 
+// ---------------------------------------------------------------------------
+// Observability (the `observe` feature; every hook is a no-op without it)
+// ---------------------------------------------------------------------------
+
+/// Reports one API call to `fastokens::observe` when dropped.
+struct ApiCall {
+    api: fastokens::observe::Api,
+    units: usize,
+    gil_released: bool,
+    /// Time from the end of the GIL-free Rust work to holding the GIL again.
+    gil_wait_ns: u64,
+    timer: fastokens::observe::Timer,
+}
+
+impl ApiCall {
+    /// Start timing a call of `units` (input bytes, or ids for decoding),
+    /// naming the calling Python thread in the snapshot the first time.
+    fn start(py: Python<'_>, api: fastokens::observe::Api, units: usize) -> Self {
+        if !fastokens::observe::current_thread_named() {
+            let name = py
+                .import("threading")
+                .and_then(|t| t.call_method0("current_thread"))
+                .and_then(|t| t.getattr("name"))
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| "python".to_owned());
+            fastokens::observe::name_current_thread(&format!("py:{name}"));
+        }
+        ApiCall {
+            api,
+            units,
+            gil_released: false,
+            gil_wait_ns: 0,
+            timer: fastokens::observe::Timer::start(),
+        }
+    }
+
+    /// Run `f` with the GIL released, counting the wait to get it back.
+    fn allow_threads<T: Send>(&mut self, py: Python<'_>, f: impl FnOnce() -> T + Send) -> T {
+        self.gil_released = true;
+        let (out, back) = py.allow_threads(|| (f(), fastokens::observe::Timer::start()));
+        self.gil_wait_ns += back.ns();
+        out
+    }
+}
+
+impl Drop for ApiCall {
+    fn drop(&mut self) {
+        fastokens::observe::api_call(
+            self.api,
+            self.units,
+            self.timer.ns(),
+            self.gil_released,
+            self.gil_wait_ns,
+        );
+    }
+}
+
+/// `fastokens.observe`'s process-wide snapshot as JSON: the thread pools, the
+/// threads, the encode paths, the API calls and the state-lock waits.
+/// `{"enabled": false}` unless built with the `observe` feature.
+#[pyfunction]
+fn observe_snapshot() -> String {
+    fastokens::observe::snapshot().to_string()
+}
+
+/// Whether this build was compiled with the `observe` feature.
+#[pyfunction]
+fn observe_enabled() -> bool {
+    fastokens::observe::ENABLED
+}
+
 fn added_token_policy(split_special_tokens: bool) -> fastokens::AddedTokenPolicy {
     if split_special_tokens {
         fastokens::AddedTokenPolicy::SkipSpecial
@@ -586,6 +657,18 @@ impl PyTokenizer {
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
+        if fastokens::observe::ENABLED {
+            match self.state.try_read() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let t = fastokens::observe::Timer::start();
+                    let g = self.state.read().expect("PyTokenizer state lock poisoned");
+                    fastokens::observe::lock_wait(fastokens::observe::Lock::Read, t.ns());
+                    return g;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {}
+            }
+        }
         self.state.read().expect("PyTokenizer state lock poisoned")
     }
 
@@ -600,17 +683,30 @@ impl PyTokenizer {
         &self,
         py: Python<'_>,
         release_gil: bool,
+        obs: &mut ApiCall,
         f: impl FnOnce(&TokenizerState) -> T + Send,
     ) -> T {
         let run = || f(&self.read());
         if release_gil {
-            py.allow_threads(run)
+            obs.allow_threads(py, run)
         } else {
             run()
         }
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, TokenizerState> {
+        if fastokens::observe::ENABLED {
+            match self.state.try_write() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let t = fastokens::observe::Timer::start();
+                    let g = self.state.write().expect("PyTokenizer state lock poisoned");
+                    fastokens::observe::lock_wait(fastokens::observe::Lock::Write, t.ns());
+                    return g;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {}
+            }
+        }
         self.state.write().expect("PyTokenizer state lock poisoned")
     }
 
@@ -996,7 +1092,9 @@ impl PyTokenizer {
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
         let policy = added_token_policy(split_special_tokens);
-        let encoding = self.with_state(py, input.len() >= RELEASE_GIL_MIN_BYTES, |state| {
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::Encode, input.len());
+        let release = input.len() >= RELEASE_GIL_MIN_BYTES;
+        let encoding = self.with_state(py, release, &mut obs, |state| {
             let ids = state
                 .inner
                 .encode_with_policy(input, add_special_tokens, policy)
@@ -1012,7 +1110,9 @@ impl PyTokenizer {
     /// Truncation and padding configured via `enable_truncation` /
     /// `enable_padding` are applied before returning.
     fn encode_ordinary(&self, input: &str, py: Python<'_>) -> PyResult<Py<PyEncoding>> {
-        let encoding = self.with_state(py, input.len() >= RELEASE_GIL_MIN_BYTES, |state| {
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeOrdinary, input.len());
+        let release = input.len() >= RELEASE_GIL_MIN_BYTES;
+        let encoding = self.with_state(py, release, &mut obs, |state| {
             let ids = state
                 .inner
                 .encode_ordinary(input)
@@ -1044,7 +1144,8 @@ impl PyTokenizer {
             })
             .collect();
         let bytes: usize = segs.iter().map(|seg| seg.text.len()).sum();
-        let encoding = self.with_state(py, bytes >= RELEASE_GIL_MIN_BYTES, |state| {
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeSegments, bytes);
+        let encoding = self.with_state(py, bytes >= RELEASE_GIL_MIN_BYTES, &mut obs, |state| {
             let ids = state
                 .inner
                 .encode_segments(&segs)
@@ -1072,10 +1173,16 @@ impl PyTokenizer {
 
         let policy = added_token_policy(split_special_tokens);
         let bytes: usize = inputs.iter().map(String::len).sum();
-        let encodings = self.with_state(py, bytes >= RELEASE_GIL_MIN_BYTES, |state| {
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeBatch, bytes);
+        let encodings = self.with_state(py, bytes >= RELEASE_GIL_MIN_BYTES, &mut obs, |state| {
+            let _job = fastokens::observe::JobGuard::start(
+                fastokens::observe::JobKind::Batch,
+                inputs.len(),
+            );
             let mut batch: Vec<Vec<u32>> = inputs
                 .par_iter()
                 .map(|s| {
+                    let _task = fastokens::observe::TaskGuard::start();
                     state
                         .inner
                         .encode_with_policy(s.as_str(), add_special_tokens, policy)
@@ -1140,10 +1247,17 @@ impl PyTokenizer {
         use rayon::prelude::*;
 
         let policy = added_token_policy(split_special_tokens);
-        let (flat, offsets) = self.with_state(py, true, |state| {
+        let bytes: usize = inputs.iter().map(String::len).sum();
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeBatchFlat, bytes);
+        let (flat, offsets) = self.with_state(py, true, &mut obs, |state| {
+            let _job = fastokens::observe::JobGuard::start(
+                fastokens::observe::JobKind::Batch,
+                inputs.len(),
+            );
             let mut batch: Vec<Vec<u32>> = inputs
                 .par_iter()
                 .map(|s| {
+                    let _task = fastokens::observe::TaskGuard::start();
                     state
                         .inner
                         .encode_with_policy(s.as_str(), add_special_tokens, policy)
@@ -1232,7 +1346,9 @@ impl PyTokenizer {
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
     fn decode(&self, ids: &Bound<'_, PyAny>, skip_special_tokens: bool) -> PyResult<String> {
+        let py = ids.py();
         let ids = Self::extract_decode_ids(ids)?;
+        let _obs = ApiCall::start(py, fastokens::observe::Api::Decode, ids.len());
         self.read()
             .inner
             .decode(&ids, skip_special_tokens)
@@ -1246,7 +1362,10 @@ impl PyTokenizer {
         sentences: &Bound<'_, PyAny>,
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
+        let py = sentences.py();
         let sentences = Self::extract_decode_batch_ids(sentences)?;
+        let units = sentences.iter().map(Vec::len).sum();
+        let _obs = ApiCall::start(py, fastokens::observe::Api::DecodeBatch, units);
         let state = self.read();
         let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
         state
@@ -1256,6 +1375,13 @@ impl PyTokenizer {
     }
 
     // ── Vocabulary ────────────────────────────────────────────────────
+
+    /// This tokenizer's side of `observe_snapshot()` as JSON: its fast paths
+    /// and its segment cache (`null` when off), shard by shard with the
+    /// `observe` feature.
+    fn observe(&self) -> String {
+        self.read().inner.observe_json().to_string()
+    }
 
     /// Look up the token ID for a string.
     fn token_to_id(&self, token: &str) -> Option<u32> {
@@ -1441,5 +1567,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostProcessor>()?;
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyDecodeStream>()?;
+    m.add_function(wrap_pyfunction!(observe_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(observe_enabled, m)?)?;
     Ok(())
 }

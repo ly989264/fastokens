@@ -67,11 +67,19 @@ fn bpe_pool() -> &'static rayon::ThreadPool {
             .filter(|&n| n >= 1)
             .unwrap_or_else(default_bpe_threads)
             .min(avail);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .expect("failed to build BPE thread pool")
+        let builder = rayon::ThreadPoolBuilder::new().num_threads(n);
+        #[cfg(feature = "observe")]
+        let builder = builder
+            .thread_name(|i| format!("fastokens-{i}"))
+            .start_handler(|_| crate::observe::register_worker());
+        builder.build().expect("failed to build BPE thread pool")
     })
+}
+
+/// Number of threads in the BPE pool (creating it if needed).
+#[cfg_attr(not(feature = "observe"), allow(dead_code))]
+pub(crate) fn bpe_pool_threads() -> usize {
+    bpe_pool().current_num_threads()
 }
 
 /// A split within a [`PreTokenizedString`]'s buffer.
@@ -174,10 +182,13 @@ impl PreTokenizedString {
             return self.tokenize_sequential(&tokenize_fn);
         }
 
+        let _job =
+            crate::observe::JobGuard::start(crate::observe::JobKind::Pretokenized, job_count);
         pool.install(|| {
             let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
                 .into_par_iter()
                 .map(|job_index| {
+                    let _task = crate::observe::TaskGuard::start();
                     let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
                     let mut ids = Vec::with_capacity(chunk.len() * 3);
                     for split in chunk {
@@ -221,10 +232,13 @@ impl PreTokenizedString {
             return Ok(ids);
         }
 
+        let _job =
+            crate::observe::JobGuard::start(crate::observe::JobKind::Pretokenized, job_count);
         pool.install(|| {
             let chunk_results: Result<Vec<Vec<u32>>, String> = (0..job_count)
                 .into_par_iter()
                 .map(|job_index| {
+                    let _task = crate::observe::TaskGuard::start();
                     let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
                     let mut ids = Vec::with_capacity(chunk.len() * 3);
                     tokenize_fn(&self.buffer, chunk, &mut ids)?;
@@ -301,10 +315,14 @@ where
         return per_chunk(buffer);
     }
 
+    let _job = crate::observe::JobGuard::start(crate::observe::JobKind::Scan, segments.len());
     pool.install(|| {
         let parts: Result<Vec<Vec<u32>>, String> = segments
             .par_iter()
-            .map(|&(s, e)| per_chunk(&buffer[s..e]))
+            .map(|&(s, e)| {
+                let _task = crate::observe::TaskGuard::start();
+                per_chunk(&buffer[s..e])
+            })
             .collect();
         let parts = parts?;
         let total: usize = parts.iter().map(Vec::len).sum();
@@ -399,10 +417,12 @@ where
         jobs.push((start..items.len(), bytes));
     }
 
+    let _job = crate::observe::JobGuard::start(crate::observe::JobKind::ScanSplits, jobs.len());
     pool.install(|| {
         let parts: Result<Vec<Vec<u32>>, String> = jobs
             .par_iter()
             .map(|(range, bytes)| {
+                let _task = crate::observe::TaskGuard::start();
                 let mut ids = Vec::with_capacity(bytes / 3 + range.len());
                 run(&items[range.clone()], &mut ids)?;
                 Ok(ids)
@@ -449,10 +469,14 @@ where
         return per_chunk(buffer);
     }
 
+    let _job = crate::observe::JobGuard::start(crate::observe::JobKind::Scan, segments.len());
     pool.install(|| {
         let parts: Result<Vec<IdsWithBounds>, String> = segments
             .par_iter()
-            .map(|&(s, e)| per_chunk(&buffer[s..e]))
+            .map(|&(s, e)| {
+                let _task = crate::observe::TaskGuard::start();
+                per_chunk(&buffer[s..e])
+            })
             .collect();
         let parts = parts?;
         let total: usize = parts.iter().map(|(ids, _)| ids.len()).sum();

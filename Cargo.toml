@@ -22,6 +22,8 @@ documentation.workspace = true
 [features]
 default = ["hf-hub"]
 hf-hub = ["dep:hf-hub", "dep:ureq"]
+# Runtime counters for observing a running tokenizer (`observe` module).
+observe = []
 
 [dependencies]
 daachorse = "1.0.0"

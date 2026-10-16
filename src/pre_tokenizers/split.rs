@@ -571,9 +571,11 @@ impl Split {
             return find_matches_pcre2(text, base, &pcre2[0]);
         }
 
+        let _job = crate::observe::JobGuard::start(crate::observe::JobKind::RegexSplit, actual);
         let chunk_results: Result<Vec<Vec<(usize, usize)>>, Error> = (0..actual)
             .into_par_iter()
             .map(|i| {
+                let _task = crate::observe::TaskGuard::start();
                 let auth_start = auth[i];
                 let auth_end = auth[i + 1];
                 // Extend past authority zone so cross-boundary matches are
@@ -715,9 +717,11 @@ impl Split {
         }
 
         let regexes = &self.regexes;
+        let _job = crate::observe::JobGuard::start(crate::observe::JobKind::RegexSplit, actual);
         let chunk_results: Result<Vec<Vec<(usize, usize)>>, Error> = (0..actual)
             .into_par_iter()
             .map(|i| {
+                let _task = crate::observe::TaskGuard::start();
                 let auth_start = auth[i];
                 let auth_end = auth[i + 1];
                 let chunk_end = snap_char_ceil(input, (auth_end + CHUNK_OVERLAP).min(input.len()));

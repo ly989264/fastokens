@@ -3,6 +3,7 @@ pub mod decoders;
 pub mod json_structs;
 pub mod models;
 pub mod normalizers;
+pub mod observe;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
@@ -1086,6 +1087,22 @@ impl Tokenizer {
         self.segment_cache = Some(SegmentCache::new(max_bytes));
     }
 
+    /// This tokenizer's side of [`observe`]: which fast paths it can take and
+    /// its segment cache (`null` when off), shard by shard with the `observe`
+    /// feature.
+    pub fn observe_json(&self) -> serde_json::Value {
+        let scanner_path = matches!(
+            &self.split_only,
+            Some(PreTokenizer::Split(inner)) if inner.scan_kind().is_some()
+        );
+        serde_json::json!({
+            "enabled": observe::ENABLED,
+            "scanner_path": scanner_path,
+            "prefix_cache": self.input_cache.is_some(),
+            "segment_cache": self.segment_cache.as_ref().map(SegmentCache::observe_json),
+        })
+    }
+
     /// Run the full encoding pipeline with control over special token insertion.
     ///
     /// When `add_special_tokens` is true, the post-processor inserts special
@@ -1177,6 +1194,7 @@ impl Tokenizer {
                 Ok(Vec::new())
             };
         }
+        let timer = observe::Timer::start();
 
         // 1. Normalize the input, optionally recognizing added vocabulary.
         let pts = match policy {
@@ -1188,9 +1206,14 @@ impl Tokenizer {
         // 2-3. Pre-tokenize and tokenize, reusing cached segment encodings when
         //      added tokens split the input into segments.
         let ids = match &self.segment_cache {
-            Some(cache) if pts.splits().len() > 1 => self.tokenize_segments_cached(&pts, cache)?,
+            Some(cache) if pts.splits().len() > 1 => {
+                let ids = self.tokenize_segments_cached(&pts, cache)?;
+                observe::set_path(observe::Path::SegmentsCached);
+                ids
+            }
             _ => self.tokenize_pre_tokenized(pts, true)?,
         };
+        observe::encode_done(input.len(), timer.ns());
 
         // 4. Post-process.
         Ok(self.post_process(ids, add_special_tokens))
@@ -1216,6 +1239,7 @@ impl Tokenizer {
                 && let PreTokenizer::Split(inner) = split
                 && let Some(kind) = inner.scan_kind()
             {
+                observe::set_path(observe::Path::ScanWhole);
                 let buffer = pts.buffer();
                 // Fused scan+BPE of a plain-text segment: one pass, split at
                 // newline boundaries, each segment scanned and BPE'd inline
@@ -1279,6 +1303,7 @@ impl Tokenizer {
                 && let PreTokenizer::Split(inner) = split
                 && let Some(kind) = inner.scan_kind()
             {
+                observe::set_path(observe::Path::ScanSplits);
                 let ids = crate::pre_tokenized::tokenize_scanned_splits(&pts, kind, |text, out| {
                     self.model.tokenize_scanned_segment(kind, text, out)
                 })
@@ -1286,6 +1311,7 @@ impl Tokenizer {
                 return Ok(ids);
             }
 
+            observe::set_path(observe::Path::FusedSplit);
             split.pre_tokenize(&mut pts)?;
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {
@@ -1295,6 +1321,7 @@ impl Tokenizer {
             return Ok(ids);
         }
 
+        observe::set_path(observe::Path::General);
         // 2. Pre-tokenize (refine splits in place).
         if let Some(ref pt) = self.pre_tokenizer {
             pt.pre_tokenize(&mut pts)?;
@@ -1364,7 +1391,9 @@ impl Tokenizer {
             }
         }
 
+        let timer = observe::Timer::start();
         let miss_ids = self.tokenize_misses(&misses)?;
+        cache.record_miss_tokenize(timer.ns());
         for ((hash, text), ids) in misses.iter().zip(&miss_ids) {
             cache.insert(*hash, text.as_bytes(), ids);
         }
@@ -1439,9 +1468,13 @@ impl Tokenizer {
         inputs: &[S],
         add_special_tokens: bool,
     ) -> Result<Vec<Vec<u32>>, Error> {
+        let _job = observe::JobGuard::start(observe::JobKind::Batch, inputs.len());
         inputs
             .par_iter()
-            .map(|input| self.encode_with_special_tokens(input.as_ref(), add_special_tokens))
+            .map(|input| {
+                let _task = observe::TaskGuard::start();
+                self.encode_with_special_tokens(input.as_ref(), add_special_tokens)
+            })
             .collect()
     }
 
@@ -2548,6 +2581,130 @@ mod local_tests {
                 .unwrap(),
             tok.encode(text).unwrap()
         );
+    }
+
+    #[cfg(feature = "observe")]
+    mod observe_tests {
+        use super::*;
+
+        /// Runs `f` on a new thread, whose observe slot is its own: exact
+        /// per-thread counts hold while other tests run.
+        fn on_fresh_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+            std::thread::spawn(f).join().unwrap()
+        }
+
+        fn n(v: &Value, path: &[&str]) -> u64 {
+            path.iter()
+                .fold(v, |v, k| &v[*k])
+                .as_u64()
+                .unwrap_or_else(|| panic!("{path:?} missing in {v}"))
+        }
+
+        const CHAT: &str =
+            "<|im_start|>user\nHello there<|im_end|><|im_start|>assistant\nthe thing<|im_end|>";
+
+        #[test]
+        fn encode_paths_and_bytes_are_counted_exactly_per_thread() {
+            on_fresh_thread(|| {
+                let tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                let plain = "Hello the world\n".repeat(20);
+                tok.encode(&plain).unwrap();
+                tok.encode(CHAT).unwrap();
+                tok.encode(CHAT).unwrap();
+                let mut cached = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                cached.enable_segment_cache(1 << 20);
+                cached.encode(CHAT).unwrap();
+                cached.encode(CHAT).unwrap();
+                // One plain segment: the cache does not apply.
+                cached.encode(&plain).unwrap();
+                let general = segment_test_tokenizer(
+                    json!({"type": "NFC"}),
+                    json!({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}),
+                );
+                general.encode("the thing").unwrap();
+                // Empty input returns before the pipeline: not counted.
+                tok.encode("").unwrap();
+
+                let me = observe::current_thread();
+                assert_eq!(n(&me, &["paths", "scan_whole"]), 2, "{me}");
+                assert_eq!(n(&me, &["paths", "scan_splits"]), 2, "{me}");
+                assert_eq!(n(&me, &["paths", "segments_cached"]), 2, "{me}");
+                assert_eq!(
+                    n(&me, &["paths", "general"]) + n(&me, &["paths", "fused_split"]),
+                    1,
+                    "{me}"
+                );
+                assert_eq!(n(&me, &["encodes"]), 7);
+                assert_eq!(
+                    n(&me, &["encode_bytes"]),
+                    (2 * plain.len() + 4 * CHAT.len() + "the thing".len()) as u64
+                );
+                assert!(n(&me, &["encode_ns"]) > 0);
+            });
+        }
+
+        #[test]
+        fn a_repeated_request_is_all_hits() {
+            let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+            tok.enable_segment_cache(1 << 20);
+            let first = tok.encode(CHAT).unwrap();
+            let a = tok.observe_json();
+            let second = tok.encode(CHAT).unwrap();
+            let b = tok.observe_json();
+            assert_eq!(first, second);
+            assert_eq!(a["enabled"], true);
+            assert_eq!(a["scanner_path"], true);
+            assert_eq!(a["prefix_cache"], false);
+            let c = |v: &Value, k: &str| n(v, &["segment_cache", k]);
+            // Text segments of CHAT: "user\nHello there", "assistant\nthe thing".
+            assert_eq!((c(&a, "hits"), c(&a, "misses")), (0, 2));
+            assert_eq!((c(&b, "hits"), c(&b, "misses")), (2, 2));
+            assert_eq!(c(&b, "hit_bytes"), c(&a, "miss_bytes"));
+            assert_eq!(c(&b, "entries"), 2);
+            assert!(c(&b, "miss_tokenize_ns") > 0);
+            let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+            assert!(plain.observe_json()["segment_cache"].is_null());
+        }
+
+        #[test]
+        fn long_inputs_and_batches_are_counted_as_pool_jobs() {
+            let tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+            let line = "Hello the world, this is the thing\n";
+            let plain = line.repeat(256 * 1024 / line.len());
+            let chat = format!("<|im_start|>{plain}<|im_end|><|im_start|>{plain}<|im_end|>");
+            let before = observe::snapshot();
+            let one = tok.encode(&plain).unwrap();
+            let two = tok.encode(&chat).unwrap();
+            let batch = tok
+                .encode_batch(&[chat.as_str(), "a", "the"], false)
+                .unwrap();
+            let after = observe::snapshot();
+            assert_eq!(batch[0], two);
+            assert!(!one.is_empty());
+            let d = |kind: &str, k: &str| {
+                n(&after, &["jobs", kind, k]) - n(&before, &["jobs", kind, k])
+            };
+            assert!(d("batch", "jobs") >= 1);
+            assert!(d("batch", "tasks") >= 3);
+            if crate::pre_tokenized::bpe_pool_threads() >= 2 {
+                assert!(d("scan", "jobs") >= 1, "{after}");
+                assert!(d("chat_splits", "jobs") >= 2, "{after}");
+                let workers: Vec<&Value> = after["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|t| t["name"].as_str().unwrap().starts_with("fastokens-"))
+                    .collect();
+                assert!(!workers.is_empty());
+                assert!(workers.iter().all(|t| t["kind"] == "worker"));
+                assert!(workers.iter().map(|t| n(t, &["tasks"])).sum::<u64>() > 0);
+            }
+            // The batch ran on rayon's global pool, whose threads are labelled
+            // workers when they run a task.
+            assert!(after["threads"].as_array().unwrap().iter().any(|t| {
+                t["name"].as_str().unwrap().starts_with("rayon-") && t["kind"] == "worker"
+            }));
+        }
     }
 }
 

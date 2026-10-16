@@ -216,6 +216,12 @@ class Tokenizer:
         self, sentences: list[list[int]], skip_special_tokens: bool = False
     ) -> list[str]: ...
 
+    def observe(self) -> str:
+        """This tokenizer's side of `observe_snapshot()` as JSON: its fast paths
+        and its segment cache (`null` when off), shard by shard with the
+        `observe` feature. See `fastokens.observe`."""
+        ...
+
     def token_to_id(self, token: str) -> Optional[int]: ...
     def id_to_token(self, id: int) -> Optional[str]: ...
 
@@ -230,3 +236,12 @@ class Tokenizer:
         Ids are assigned as HuggingFace ``tokenizers`` assigns them: a content
         already in the vocabulary keeps its id and only its flags can change,
         anything else is appended above the vocabulary."""
+
+def observe_snapshot() -> str:
+    """Process-wide counters as JSON: thread pools, threads, encode paths, API
+    calls, state-lock waits. `{"enabled": false}` without the `observe` feature."""
+    ...
+
+def observe_enabled() -> bool:
+    """Whether this build has the `observe` feature."""
+    ...
