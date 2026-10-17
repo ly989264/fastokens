@@ -8,9 +8,13 @@
 - **最慢的请求**，以及它们各阶段的耗时；
 - Python API 调用的时间分别花在 Rust、等 GIL 和 Python 哪一部分。
 
+另有两个从外部看 fastokens 的工具（第 3.4、3.5 节）：
+- **CPU 采样**（`python -m fastokens.observe sample`，任何构建都能用）：用系统自带的采样器（macOS 的 `sample`；Linux 的 `perf`，**未在 Linux 上验证**）对一个进程采样，把每个样本归到流水线阶段、分配器、memcpy、哈希、正则引擎、线程池、GIL、Python 解释器等类别，并输出可直接画火焰图的折叠栈。也能分析 HF `tokenizers` 的栈，便于对照。
+- **分层拆分**（`python -m fastokens.observe layers`，需要 observe 构建）：把一次调用拆成"fastokens 之外（调用方、transformers 包装层）/ 绑定层 Python 侧 / 等 GIL / 建 Python 列表 / Rust 各阶段"。
+
 关闭时，所有埋点都是空函数，或者是零大小、不带析构的类型，编译出来的代码和原来一样。
 
-开启时的开销实测（M2 Pro，GLM-5.3 agent 流量，1920 个请求，三个构建交替跑，取每个构建 3 轮中的最好值）：和未加观测的版本相比在 −2.0% 到 +1.3% 之间，属于噪声。
+开启时的开销实测（M2 Pro，GLM-5.3 agent 流量，1920 个请求；同一个 commit 只差 `--features observe`，开关缓存 × 1 / 4 个线程，perflock 下交替跑 5 轮、逐轮配对比较）：−0.7% 到 +1.5%（正数表示开了 observe 反而快），即测不出开销。
 
 ## 1. 能剖析什么
 
@@ -110,6 +114,72 @@ cd examples/agent
 python observe_load.py --threads 4 --cache-mib 256 --report-every 5
 ```
 
+### 3.4 CPU 采样：CPU 到底花在哪（任何构建）
+
+```bash
+# 采样一个正在跑的进程 10 秒
+python -m fastokens.observe sample --pid 12345 --seconds 10 --out prof
+# 启动一个命令，等它热身 3 秒，再采样 10 秒，之后结束它
+python -m fastokens.observe sample --seconds 10 --delay 3 --out prof -- python my_load.py
+# 重新分析以前采到的原始输出（macOS `sample` 的报告，或 `perf script` 的输出）
+python -m fastokens.observe sample --from prof.raw.txt
+```
+
+```python
+import fastokens.observe as obs
+s = obs.sample("prof", pid=12345, seconds=10)   # 返回汇总 dict；s["report"] 是文字报告
+```
+
+- 输出：`prof.txt`（文字报告）、`prof.json`（汇总）、`prof.folded`（折叠栈，每行 `线程;帧;…;帧 次数`，可直接交给 FlameGraph 的 `flamegraph.pl` 或 speedscope 画火焰图）、`prof.raw.txt`（采样器的原始输出）。
+- 采样器：macOS 用系统自带的 `/usr/bin/sample`（每 1 ms 一次，不需要权限，不需要安装任何东西）；Linux 用 `perf record -g` + `perf script`，需要装 `perf` 并有权限（`kernel.perf_event_paranoid ≤ 1` 或 root）。**Linux 这条路径没有在 Linux 上验证过。** 两者都没有时会明确报错。
+- 采样本进程时，`sample()` 会阻塞 `seconds` 秒，负载要放在另一个线程里跑。
+
+**怎么归类**：每个样本按栈顶函数（自身时间）归类；分配、memcpy、哈希、正则这类通用函数，还会再记一笔"是哪个流水线阶段调用的"（报告里的 "called from"）。
+
+| 类别 | 含义 |
+|---|---|
+| `stage: special-token matching / normalize / pre-tokenize / BPE / segment cache / prefix cache / post-process / decode` | 流水线各阶段的 Rust 代码本身（fastokens 和 HF `tokenizers` 都按模块名识别） |
+| `Rust: other (fastokens)` / `Rust: other (HF tokenizers)` | 不属于某一个阶段的 Rust 代码（流程调度、泛型的总控函数等） |
+| `allocator (malloc/free/realloc)` | 系统分配器，含 macOS 释放路径里的 `mach_absolute_time` |
+| `allocator (Python obmalloc)` | Python 自己的小对象分配器 |
+| `memcpy/memmove/memset` | 内存拷贝和清零 |
+| `hashing / hash tables` | SipHash、ahash、hashbrown 查表、segment cache 的哈希函数 |
+| `regex engine` | PCRE2（含 JIT 生成的代码）、onig、fancy-regex |
+| `locks / condvars` | 互斥锁、条件变量的唤醒等（在 CPU 上的部分） |
+| `thread pool: scheduling / spin` | rayon / crossbeam 的调度、窃取和让出（`swtch_pri`、`sched_yield`）——在 CPU 上空转 |
+| `binding: input str -> UTF-8` | 绑定层把传入的 Python 字符串转成 UTF-8（含非 ASCII 字符的字符串，CPython 每次都要重新编码） |
+| `binding: building Python lists / objects` | 绑定层调用的 Python C API：建 `.ids` 等列表（`PyList_SetItem`、`Py_IncRef`）、建 Encoding 对象 |
+| `binding: Rust side (pyo3, conversions)` | 绑定层自己的 Rust 代码（pyo3 转换、填列表的循环） |
+| `Python: freeing objects` | 释放 Python 对象（大列表的 `list_dealloc` 等），通常是上一次调用返回的结果被丢弃 |
+| `Python interpreter (caller code, transformers, Jinja)` | Python 解释器本身。原生采样看不到 Python 函数名，所以调用方代码、transformers 包装层、Jinja 模板都在这里；要拆开它们用第 3.5 节 |
+| `GIL wait` / `thread pool: blocked` / `idle / blocked (other)` | 阻塞中的线程，不占 CPU。报告的主表只算在 CPU 上的样本，阻塞的单独列出 |
+
+### 3.5 分层拆分：一次调用的时间在哪一层（需要 observe 构建）
+
+```bash
+# 直接调 fastokens：Tokenizer.encode(text).ids
+python -m fastokens.observe layers --tokenizer path/to/tokenizer.json --inputs prompts.json
+# 经过 transformers：patch_transformers() 之后 tok(text)["input_ids"]
+python -m fastokens.observe layers --via transformers --tokenizer zai-org/GLM-5.3 --inputs prompts.json --json
+```
+
+```python
+r = obs.layers(lambda: tok(text)["input_ids"], calls=200)
+print(obs.layers_report(r))
+```
+
+`--inputs` 是一个 JSON 列表（元素是字符串，或字符串列表，会被展开），也可以是一个文本文件（整个文件当一个输入）。缓存按平时的环境变量设置。结果分五层：
+
+| 层 | 怎么算 |
+|---|---|
+| API 调用之外（调用方、transformers、输入字符串转 UTF-8、释放上一次的结果） | 外层总时间 − 下面四层。pyo3 在进入 API 计时之前就把传入的 `str` 转成 UTF-8，所以这一步算在这里；含非 ASCII 字符的长文本这一步并不便宜。用第 3.4 节的采样可以把它和释放结果、transformers 代码分开 |
+| 绑定层 Python 侧 | fastokens API 调用内、Rust 之外的时间（参数转换、建 Encoding 对象） |
+| 等 GIL | Rust 释放 GIL 后重新拿回来所等的时间 |
+| 建 Python 列表 | 读 `.ids`、`attention_mask` 等属性时建列表的时间（`encoding_ids` / `encoding_lists`） |
+| fastokens Rust | Rust 内的时间，再按编码阶段拆开；"rest of Rust" 是状态锁、批量编排等 |
+
+注意：多输入的 `encode_batch` 会在线程池里并行编码，各阶段时间是多个线程的 CPU 时间之和，可能大于调用线程上的 Rust 时间，报告会注明。
+
 ## 4. 怎么读
 
 一个实际例子：GLM-5.3，main，4 个线程跑 agent 流量。
@@ -142,6 +212,38 @@ BPE pretoken cache: hit rate 99.2%, 0.67 us per merge, merge 占模型时间 69.
 | 状态锁写等待 > 0 | 有线程在其他线程编码时修改了配置 | 尽量在启动时配置好 |
 | 最慢编码里某个阶段特别大 | 长尾请求就卡在这个阶段 | 对照它的字节数和路径 |
 
+### 4.1 怎么读 CPU 采样和分层拆分
+
+一个实际例子：GLM-5.3，main `b7d0d42`，一个 Python 线程按会话顺序重放 opencode 请求，`Tokenizer.encode(text).ids`。开着 segment cache，每轮换一个冷的分词器，3 次采样的平均值：
+
+```
+where the CPU goes (on-CPU samples, by the function on top of the stack):
+  binding: building Python lists / objects        25.8%      ← .ids 列表：Py_IncRef / PyList_SetItem
+  binding: input str -> UTF-8                     21.4%      ← 传入的 str 转 UTF-8
+  stage: special-token matching                   13.9%
+  Python: freeing objects (lists, Encodings)      13.2%      ← 上一次返回的列表被释放
+  memcpy/memmove/memset                            6.3%
+  regex engine                                     5.7%
+  ...
+  allocator (malloc/free/realloc)                  1.7%
+layers: 0.926 ms/call = outside the API calls 0.351 + building Python lists 0.280 + fastokens Rust 0.295
+```
+
+从这个例子能直接读出：
+- 开缓存后，fastokens 的 Rust 部分只占约三分之一；剩下的是 Python 对象的进出：建 `.ids` 列表、把输入转成 UTF-8、释放上一次的列表，合计约 60%。
+- 系统分配器只占约 2%。
+
+同样的工具对 HF `tokenizers` 0.22.2（经过 transformers）采样：分配器 36.6%、哈希 19.8%、memcpy 9.2%、正则 9.3%。
+
+| 现象 | 说明 | 方向 |
+|---|---|---|
+| `allocator` 占比高 | 看 "called from" 是哪个阶段 | 预分词里高：分段时的 `Vec` / `String`；在阶段之外：拼接结果、建对象 |
+| `binding: building Python lists` 占比高 | 结果里的 token id 很多，每个元素要一次引用计数和一次写入 | 只要 id 不要列表时用 `encode_batch_flat`（返回字节，numpy 可直接用） |
+| `binding: input str -> UTF-8` 占比高 | 输入里有非 ASCII 字符，CPython 每个新字符串都要编码一次 | 同一段文本反复编码时，复用同一个 `str` 对象（它会缓存 UTF-8） |
+| `thread pool: scheduling / spin` 占比高 | 线程池在空转（任务太小，或者线程比活多） | 看第 1.3 节的并行度；可以试 `FASTOKENS_BPE_THREADS` |
+| `Python interpreter` 占比高 | 时间花在 Python 代码里（调用方、transformers、Jinja） | 用分层拆分看 fastokens 之外的部分；Jinja 要在调用方那边优化 |
+| `GIL wait` 多 | 线程在等 GIL | 多进程，而不是多线程 |
+
 ## 5. 局限
 
 - 快照不是一个原子时刻，但每个计数器都单调递增，算出来的速率和比例是准的。
@@ -151,3 +253,4 @@ BPE pretoken cache: hit rate 99.2%, 0.67 us per merge, merge 占模型时间 69.
 - 线程表最多记 255 个线程，之后的合并为"(other threads)"。
 - p50/p99 来自 log2 直方图，显示的是所在桶的上界。
 - 仪表盘只监听 127.0.0.1，没有鉴权；不要暴露到公网。
+- CPU 采样：macOS 的 `sample` 会采到所有线程，包括阻塞的线程，所以报告把阻塞类单独列出；`swtch_pri` 这类让出 CPU 的自旋算作"在 CPU 上"。原生采样看不到 Python 函数名。Rust 符号不解码，按名字里的模块名识别，泛型实例化的名字里同时出现多个阶段时归入 "Rust: other"。Linux 的 `perf` 路径未验证。

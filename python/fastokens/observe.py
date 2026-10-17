@@ -26,6 +26,19 @@ and from another terminal::
     python -m fastokens.observe top     --url http://127.0.0.1:9464
     python -m fastokens.observe profile --url http://127.0.0.1:9464 --seconds 10
 
+Two tools look at fastokens from the outside and work with any build:
+
+- :func:`sample` / ``python -m fastokens.observe sample``: CPU sampling of a
+  process (macOS ``sample``; Linux ``perf``, unverified), each sample
+  attributed to a pipeline stage, the allocator, memcpy, hashing, the regex
+  engine, the thread pools, the GIL, the Python interpreter, ...; writes a
+  report, JSON and folded stacks for flame graphs. It also reads HF
+  ``tokenizers`` stacks.
+- :func:`layers` / ``python -m fastokens.observe layers``: a call split into
+  the code around fastokens (the caller, transformers), the binding's Python
+  side, the GIL wait, building Python lists and Rust by stage (this one needs
+  the ``observe`` build).
+
 ``tok`` may be a ``fastokens._native.Tokenizer``, the shim that
 ``fastokens.patch_transformers()`` installs, or a ``transformers`` fast
 tokenizer wrapping either.
@@ -48,7 +61,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import _native
 
-__all__ = ["enabled", "snapshot", "analyze", "report", "profile", "reset_slow", "serve", "prometheus"]
+__all__ = ["enabled", "snapshot", "analyze", "report", "profile", "reset_slow", "serve", "prometheus",
+           "sample", "layers", "layers_report"]
 
 STAGES = ["added_tokens", "normalize", "prefix_cache", "pretokenize", "model",
           "cache_lookup", "cache_assemble", "post_process"]
@@ -652,6 +666,79 @@ def serve(tokenizers=None, port: int = 9464, host: str = "127.0.0.1") -> Threadi
     return server
 
 
+# ── sampling and layers (see _profile.py) ────────────────────────────────────
+
+
+def sample(out: str | None = None, *, pid: int | None = None, cmd: list[str] | None = None,
+           from_file: str | None = None, seconds: float = 10.0, delay: float = 1.0, interval_ms: int = 1) -> dict:
+    """CPU-sample process ``pid`` (or start ``cmd`` and sample it after
+    ``delay`` seconds; or read the raw output of an earlier run from
+    ``from_file``) and attribute the samples. With ``out``, writes
+    ``<out>.txt`` (report), ``.json``, ``.folded`` (folded stacks) and
+    ``.raw.txt``. Returns the summary; ``["report"]`` is the text.
+
+    Sampling a pid blocks for ``seconds``; to sample this process, run the
+    workload in another thread."""
+    from . import _profile
+    return _profile.run(out, pid=pid, cmd=cmd, from_file=from_file, seconds=seconds, delay=delay,
+                        interval_ms=interval_ms)
+
+
+def layers(fn, calls: int = 1, warmup: int = 1, tokenizers=None) -> dict:
+    """Run ``fn()`` ``calls`` times and split the time into: outside the
+    fastokens API calls (caller, transformers, converting the input ``str`` to
+    UTF-8, freeing results), the binding's Python side, waiting for the GIL,
+    building Python lists, and Rust by stage. Needs the ``observe`` build."""
+    from . import _profile
+    return _profile.layers(fn, calls, warmup, tokenizers)
+
+
+def layers_report(result: dict, title: str = "") -> str:
+    """:func:`layers` as text."""
+    from . import _profile
+    return _profile.layers_report(result, title)
+
+
+def _load_inputs(path: str) -> list[str]:
+    if path.endswith(".json"):
+        with open(path) as f:
+            data = json.load(f)
+        flat = []
+        for x in data if isinstance(data, list) else [data]:
+            flat.extend(x if isinstance(x, list) else [x])
+        return [str(x) for x in flat]
+    with open(path, encoding="utf-8") as f:
+        return [f.read()]
+
+
+def _layers_cli(a) -> int:
+    inputs = _load_inputs(a.inputs)
+    n = a.calls or len(inputs)
+    if a.via == "transformers":
+        import contextlib
+        import fastokens
+        with contextlib.redirect_stdout(sys.stderr):   # keep stdout to the report / JSON
+            fastokens.patch_transformers()
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(a.tokenizer)
+        call = lambda text: tok(text)["input_ids"]  # noqa: E731
+    else:
+        path = a.tokenizer
+        if os.path.isdir(path):
+            path = os.path.join(path, "tokenizer.json")
+        tok = _native.Tokenizer.from_file(path)
+        call = lambda text: tok.encode(text).ids  # noqa: E731
+    it = iter(range(10**18))
+    r = layers(lambda: call(inputs[next(it) % len(inputs)]), calls=n, warmup=min(3, len(inputs)), tokenizers={"t": tok})
+    if a.json:
+        r = dict(r)
+        r.pop("analysis", None)
+        print(json.dumps(r, indent=1))
+    else:
+        sys.stdout.write(layers_report(r, f"{a.via}, {os.path.basename(a.tokenizer.rstrip('/'))}"))
+    return 0
+
+
 # ── command line ──────────────────────────────────────────────────────────────
 
 
@@ -681,7 +768,39 @@ def main(argv=None):
     prof.add_argument("--json", action="store_true", help="print analyze() as JSON instead of text")
     dump = sub.add_parser("dump", help="print one /json snapshot")
     dump.add_argument("--url", default="http://127.0.0.1:9464")
+    smp = sub.add_parser("sample", help="CPU-sample a process and attribute the samples (macOS sample; Linux perf, unverified)",
+                         description="python -m fastokens.observe sample [--pid PID | --from FILE | -- COMMAND ...]")
+    smp.add_argument("--pid", type=int, help="process to sample")
+    smp.add_argument("--from", dest="from_file", help="analyze the raw output of an earlier run (a `sample` report or `perf script` output)")
+    smp.add_argument("--seconds", type=float, default=10.0)
+    smp.add_argument("--delay", type=float, default=1.0, help="with a command: seconds to let it warm up before sampling")
+    smp.add_argument("--interval-ms", type=int, default=1)
+    smp.add_argument("--out", help="write <out>.txt, <out>.json, <out>.folded (flame graph input) and <out>.raw.txt")
+    smp.add_argument("--json", action="store_true", help="print the summary as JSON instead of text")
+    smp.add_argument("command", nargs=argparse.REMAINDER, help="-- the command to start and sample")
+    lay = sub.add_parser("layers", help="split calls into caller/transformers, binding, GIL wait, lists and Rust stages (observe build)")
+    lay.add_argument("--tokenizer", required=True, help="tokenizer.json, or a model dir / Hub id with --via transformers")
+    lay.add_argument("--via", choices=["native", "transformers"], default="native",
+                     help="native: Tokenizer.encode(text).ids; transformers: patch_transformers() then tok(text)['input_ids']")
+    lay.add_argument("--inputs", required=True, help="a .json list of strings (lists of strings are flattened), or a text file used as one input")
+    lay.add_argument("--calls", type=int, default=0, help="number of calls (default: every input once)")
+    lay.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    if a.cmd == "sample":
+        cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+        if not (a.pid or a.from_file or cmd):
+            ap.error("sample needs --pid, --from or -- COMMAND")
+        s = sample(a.out, pid=a.pid, cmd=cmd or None, from_file=a.from_file, seconds=a.seconds, delay=a.delay,
+                   interval_ms=a.interval_ms)
+        if a.json:
+            print(json.dumps({k: v for k, v in s.items() if k != "report"}, indent=1))
+        else:
+            sys.stdout.write(s["report"])
+            if a.out:
+                sys.stdout.write(f"wrote {a.out}.txt, {a.out}.json, {a.out}.folded\n")
+        return 0
+    if a.cmd == "layers":
+        return _layers_cli(a)
     if a.cmd == "dump":
         print(json.dumps(_fetch(a.url), indent=1))
         return 0
