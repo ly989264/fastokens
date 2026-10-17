@@ -123,7 +123,10 @@ def _post(url, body=b""):
 # ── every build ──────────────────────────────────────────────────────────────
 
 
-def test_snapshot_and_tokenizer_json_are_valid_in_every_build():
+def test_snapshot_and_tokenizer_json_are_valid_in_every_build(monkeypatch):
+    # The caches are off unless the environment turns them on.
+    monkeypatch.delenv("FASTOKENS_INPUT_CACHE", raising=False)
+    monkeypatch.delenv("FASTOKENS_SEGMENT_CACHE", raising=False)
     tok = _tiny()
     p = json.loads(_native.observe_snapshot())
     assert p["enabled"] is ENABLED
@@ -408,7 +411,9 @@ def test_profile_breaks_encodes_into_stages(tmp_path, qwen):
 
 
 @needs_observe
-def test_bpe_cache_hits_on_a_repeat(tmp_path):
+def test_bpe_cache_hits_on_a_repeat(tmp_path, monkeypatch):
+    # A prefix cache would answer the repeat without the BPE cache.
+    monkeypatch.delenv("FASTOKENS_INPUT_CACHE", raising=False)
     scan = _scanner(tmp_path)
     text = " ".join(f"word{i}" for i in range(2000))  # under 64 KiB: runs here
     with obs.profile() as first:
@@ -445,7 +450,72 @@ def test_prefix_cache_reuse_is_counted(tmp_path):
 
 
 @needs_observe
-def test_segment_cache_counters_follow_the_traffic():
+def test_chat_prefix_cache_counters_reconcile(tmp_path):
+    tok = _scanner(tmp_path, FASTOKENS_INPUT_CACHE=4)
+    plain = _scanner(tmp_path)
+    base = _chat(12, seed=11)
+    longer = base + _chat(1, seed=12)
+    short = _chat(1, seed=13, body=10)
+    prose = "".join(f"line {i}: hello the thing\n" for i in range(400))
+    assert len(short) < 4096 < len(base) and len(prose) > 4096
+    with obs.profile({"t": tok}) as p:
+        # A miss, an exact repeat, a continuation; then input the chat path
+        # leaves alone: too short, and without added tokens.
+        for text in (base, base, longer, short, prose):
+            assert tok.encode(text).ids == plain.encode(text).ids
+    c = json.loads(tok.observe())["prefix_cache"]["chat"]
+    assert (c["lookups"], c["exact_hits"], c["prefix_hits"], c["misses"]) == (3, 1, 1, 1)
+    assert (c["bypass_short"], c["bypass_plain"], c["marker_fallbacks"]) == (1, 1, 0)
+    assert (c["inserts"], c["replaced"], c["evicted_entries"], c["entries"]) == (2, 1, 0, 1)
+    assert (c["cut_backoffs"], c["no_cut"], c["lock_contended"]) == (0, 0, 0)
+    # Invariants: every looked-up byte was reused or encoded; every insert is
+    # still there, was replaced or was evicted.
+    assert c["lookup_bytes"] == 2 * len(base) + len(longer)
+    assert c["reused_bytes"] + c["encoded_bytes"] == c["lookup_bytes"]
+    assert c["reused_bytes"] > len(base) and c["reused_tokens"] > 0
+    assert c["entries"] == c["inserts"] - c["replaced"] - c["evicted_entries"] - c["cleared_entries"]
+    assert c["bytes"] > len(longer) and c["index_blocks"] >= len(longer) // 4096
+    assert (c["rejected_oversized"], c["max_bytes"]) == (0, 2048 * 2**20)
+    # The totals under `prefix_cache` add the plain-text cache's (the prose).
+    top = json.loads(tok.observe())["prefix_cache"]
+    assert top["lookups"] == c["lookups"] + 1
+    # Analysis, report (`top`) and Prometheus agree with the counters.
+    a = p.data["tokenizers"]["t"]["prefix_cache"]["chat"]
+    assert (a["lookups"], a["exact_hits"], a["prefix_hits"], a["replaced"]) == (3, 1, 1, 1)
+    assert a["reused_share"] == pytest.approx(c["reused_bytes"] / c["lookup_bytes"])
+    report = p.report()
+    assert "prefix cache (chat) [t]" in report and "cut backoffs 0" in report and "rejected too large 0" in report
+    parser = pytest.importorskip("prometheus_client.parser")
+    samples = {}
+    for fam in parser.text_string_to_metric_families(obs.prometheus(obs.snapshot({"t": tok}))):
+        for s in fam.samples:
+            samples[s.name] = s.value
+    assert samples["fastokens_prefix_cache_chat_lookups_total"] == c["lookups"]
+    assert samples["fastokens_prefix_cache_chat_replaced_total"] == c["replaced"]
+    assert samples["fastokens_prefix_cache_chat_bytes"] == c["bytes"]
+    assert samples["fastokens_prefix_cache_chat_max_bytes"] == c["max_bytes"]
+
+
+@needs_observe
+def test_chat_prefix_cache_keeps_to_its_byte_budget(tmp_path):
+    # 2 MiB: an input whose entry would cost over 32 KiB is not cached (this
+    # model has about one token per byte, so an entry costs ~5 bytes a byte).
+    tok = _scanner(tmp_path, FASTOKENS_INPUT_CACHE=4, FASTOKENS_INPUT_CACHE_MIB=2)
+    plain = _scanner(tmp_path)
+    small, big = _chat(4, seed=21), _chat(40, seed=22)
+    assert 4096 < len(small) < 7000 and len(big) > 20_000
+    for text in (small, big, big):
+        assert tok.encode(text).ids == plain.encode(text).ids
+    c = json.loads(tok.observe())["prefix_cache"]["chat"]
+    assert c["max_bytes"] == 2 * 2**20
+    assert (c["inserts"], c["entries"], c["rejected_oversized"]) == (1, 1, 2)
+    assert c["rejected_bytes"] > 2 * len(big)
+
+
+@needs_observe
+def test_segment_cache_counters_follow_the_traffic(monkeypatch):
+    # A prefix cache would answer the repeat before the segment cache.
+    monkeypatch.delenv("FASTOKENS_INPUT_CACHE", raising=False)
     tok = _with_env("FASTOKENS_SEGMENT_CACHE", 64, lambda: Tokenizer.from_model(MODEL))
     chat = _chat(20, seed=4)
     first = tok.encode(chat).ids

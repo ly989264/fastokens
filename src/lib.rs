@@ -7,6 +7,7 @@ pub mod observe;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
+mod prefix_cache;
 mod segment_cache;
 pub mod tiktoken;
 
@@ -38,9 +39,10 @@ pub use self::{
 };
 
 use self::{
-    added_tokens::Segment,
+    added_tokens::{Segment, SpannedSegment, TokenSpan},
     decoders::Decoder,
     pre_tokenized::{PreTokenizedString, Split as PtSplit},
+    prefix_cache::{Cut, Event, Outcome, PrefixCache},
     segment_cache::SegmentCache,
 };
 
@@ -534,15 +536,69 @@ impl InputCache {
     }
 }
 
-/// Build an [`InputCache`] from the `FASTOKENS_INPUT_CACHE` env var (a capacity),
-/// or `None` if unset — the default.
-fn input_cache_from_env() -> Option<Mutex<InputCache>> {
+/// The capacity set by the `FASTOKENS_INPUT_CACHE` env var, or `None` if unset
+/// — the default.
+fn input_cache_capacity_from_env() -> Option<usize> {
     std::env::var("FASTOKENS_INPUT_CACHE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&c| c >= 1)
-        .map(|c| Mutex::new(InputCache::new(c)))
 }
+
+/// Build an [`InputCache`] from the `FASTOKENS_INPUT_CACHE` env var (a capacity),
+/// or `None` if unset — the default.
+fn input_cache_from_env() -> Option<Mutex<InputCache>> {
+    input_cache_capacity_from_env().map(|c| Mutex::new(InputCache::new(c)))
+}
+
+/// The [`PrefixCache`]'s byte budget when `FASTOKENS_INPUT_CACHE_MIB` is unset.
+const DEFAULT_PREFIX_CACHE_MIB: usize = 2048;
+
+/// The smallest [`PrefixCache`] budget, as the env var allows: below 64 bytes
+/// the per-entry limit (1/64 of it) would turn every input away.
+const MIN_PREFIX_CACHE_BYTES: usize = 1 << 20;
+
+/// The [`PrefixCache`]'s byte budget: `FASTOKENS_INPUT_CACHE_MIB` (MiB), or
+/// [`DEFAULT_PREFIX_CACHE_MIB`] if it is unset or not a positive number.
+fn prefix_cache_max_bytes_from_env() -> usize {
+    std::env::var("FASTOKENS_INPUT_CACHE_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mib| mib >= 1)
+        .unwrap_or(DEFAULT_PREFIX_CACHE_MIB)
+        .saturating_mul(1 << 20)
+}
+
+/// Build a [`PrefixCache`] from the `FASTOKENS_INPUT_CACHE` env var, which
+/// sizes both prefix caches, or `None` if unset — the default.
+fn prefix_cache_from_env() -> Option<PrefixCache> {
+    input_cache_capacity_from_env().map(|c| PrefixCache::new(c, prefix_cache_max_bytes_from_env()))
+}
+
+/// The prefix cache's [`observe`] figures: the plain-text [`InputCache`]'s and
+/// the chat-template [`PrefixCache`]'s summed under the keys they share (one
+/// switch, one capacity), and the latter's own figures under `chat`.
+fn prefix_cache_json(
+    plain: Option<serde_json::Value>,
+    chat: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let (Some(mut sum), Some(chat)) = (plain.clone(), chat.clone()) else {
+        return plain.or(chat);
+    };
+    for (key, value) in sum.as_object_mut()? {
+        if key != "capacity"
+            && let (Some(a), Some(b)) = (value.as_u64(), chat[key].as_u64())
+        {
+            *value = (a + b).into();
+        }
+    }
+    sum["chat"] = chat;
+    Some(sum)
+}
+
+/// Stands in for an added token's id while the prefix cache encodes an input,
+/// so that the token's position in the output can be found.
+const SPAN_MARKER: u32 = u32::MAX - 1;
 
 /// Options applied while constructing a [`Tokenizer`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -659,6 +715,9 @@ pub struct Tokenizer {
     split_only: Option<PreTokenizer>,
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
+    /// Optional prefix cache for input with added tokens (chat templates);
+    /// enabled together with `input_cache`.
+    prefix_cache: Option<PrefixCache>,
     /// Optional cache of text-segment encodings; `None` (off) unless enabled.
     segment_cache: Option<SegmentCache>,
     /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
@@ -721,6 +780,7 @@ impl Tokenizer {
             decoder,
             split_only,
             input_cache: input_cache_from_env(),
+            prefix_cache: prefix_cache_from_env(),
             segment_cache: segment_cache::from_env(),
             needs_vocab_splitting,
         })
@@ -866,6 +926,7 @@ impl Tokenizer {
             decoder,
             split_only,
             input_cache: input_cache_from_env(),
+            prefix_cache: prefix_cache_from_env(),
             segment_cache: segment_cache::from_env(),
             needs_vocab_splitting,
         })
@@ -1104,14 +1165,23 @@ impl Tokenizer {
         self.added_tokens = added_tokens;
 
         // Cached encodings were produced against the previous vocabulary.
+        self.clear_caches();
+
+        Ok(changed)
+    }
+
+    /// Drop every cached encoding, as needed whenever something they depend on
+    /// (the vocabulary, the normalizer) changes.
+    fn clear_caches(&self) {
         if let Some(cache) = &self.input_cache {
             cache.lock().unwrap().clear();
+        }
+        if let Some(cache) = &self.prefix_cache {
+            cache.clear();
         }
         if let Some(cache) = &self.segment_cache {
             cache.clear();
         }
-
-        Ok(changed)
     }
 
     /// Return the decoder, if any.
@@ -1127,13 +1197,33 @@ impl Tokenizer {
         self.encode_with_special_tokens(input, false)
     }
 
-    /// Enable the opt-in prefix cache (see [`InputCache`]) retaining up to
-    /// `capacity` recent encodings. Reuses the leading token ids of inputs that
-    /// share a byte prefix (shared system prompts / long shared contexts), and
-    /// the whole encoding of an exact repeat. Leave it off for wholly-unique
-    /// traffic.
+    /// Enable the opt-in prefix cache retaining up to `capacity` recent
+    /// encodings (also enabled by `FASTOKENS_INPUT_CACHE=<capacity>`). Reuses
+    /// the leading token ids of inputs that share a byte prefix (shared system
+    /// prompts / long shared contexts), and the whole encoding of an exact
+    /// repeat. Leave it off for wholly-unique traffic.
+    ///
+    /// Input with added tokens, as chat-template output always is, goes
+    /// through [`PrefixCache`]: a request that re-sends a conversation reuses
+    /// the ids of the previous request up to the last added token they share.
+    /// That cache also keeps within a byte budget, `FASTOKENS_INPUT_CACHE_MIB`
+    /// or 2048 MiB (see [`Self::enable_input_cache_with_budget`]). Plain text
+    /// goes through [`InputCache`].
     pub fn enable_input_cache(&mut self, capacity: usize) {
+        self.enable_input_cache_with_budget(capacity, prefix_cache_max_bytes_from_env());
+    }
+
+    /// [`Self::enable_input_cache`] with the chat-template cache holding at
+    /// most `max_bytes` (at least 1 MiB) of inputs, ids and bookkeeping, about
+    /// 2.2 bytes per input byte. An input costing more than 1/64 of that is not
+    /// cached. The budget is this tokenizer's own, on top of its segment
+    /// cache's.
+    pub fn enable_input_cache_with_budget(&mut self, capacity: usize, max_bytes: usize) {
         self.input_cache = Some(Mutex::new(InputCache::new(capacity)));
+        self.prefix_cache = Some(PrefixCache::new(
+            capacity,
+            max_bytes.max(MIN_PREFIX_CACHE_BYTES),
+        ));
     }
 
     /// Enable the opt-in segment cache, holding at most about `max_bytes` of
@@ -1160,7 +1250,10 @@ impl Tokenizer {
         serde_json::json!({
             "enabled": observe::ENABLED,
             "scanner_path": scanner_path,
-            "prefix_cache": self.input_cache.as_ref().map(|c| c.lock().unwrap().observe_json()),
+            "prefix_cache": prefix_cache_json(
+                self.input_cache.as_ref().map(|c| c.lock().unwrap().observe_json()),
+                self.prefix_cache.as_ref().map(PrefixCache::observe_json),
+            ),
             "segment_cache": self.segment_cache.as_ref().map(SegmentCache::observe_json),
         })
     }
@@ -1177,7 +1270,7 @@ impl Tokenizer {
         input: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Error> {
-        self.encode_inner(input, add_special_tokens, AddedTokenPolicy::All)
+        self.encode_whole(input, add_special_tokens, AddedTokenPolicy::All)
     }
 
     /// Encode through the base tokenizer pipeline without recognizing added
@@ -1202,7 +1295,7 @@ impl Tokenizer {
         add_special_tokens: bool,
         policy: AddedTokenPolicy,
     ) -> Result<Vec<u32>, Error> {
-        self.encode_inner(input, add_special_tokens, policy)
+        self.encode_whole(input, add_special_tokens, policy)
     }
 
     /// Encode a pre-segmented input, concatenating the token ids of each
@@ -1241,6 +1334,169 @@ impl Tokenizer {
             }
         }
         Ok(ids)
+    }
+
+    /// [`Self::encode_inner`] for a whole input, through the prefix cache when
+    /// it applies: enabled, and added tokens can split the input.
+    fn encode_whole(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+    ) -> Result<Vec<u32>, Error> {
+        if let Some(cache) = &self.prefix_cache
+            && let Some(added) = &self.added_tokens
+            && !matches!(policy, AddedTokenPolicy::None)
+        {
+            if (prefix_cache::BLOCK..=u32::MAX as usize).contains(&input.len()) {
+                return self.encode_prefix_cached(input, add_special_tokens, policy, cache, added);
+            }
+            cache.note(Event::BypassShort);
+        }
+        self.encode_inner(input, add_special_tokens, policy)
+    }
+
+    /// Encode `input` reusing the ids of the cached input it shares the
+    /// longest prefix with (see [`PrefixCache`]), and cache the result.
+    fn encode_prefix_cached(
+        &self,
+        input: &str,
+        add_special_tokens: bool,
+        policy: AddedTokenPolicy,
+        cache: &PrefixCache,
+        added: &AddedTokens,
+    ) -> Result<Vec<u32>, Error> {
+        let timer = observe::Timer::start();
+        observe::begin_encode();
+        let skip_special = matches!(policy, AddedTokenPolicy::SkipSpecial);
+        let bytes = input.as_bytes();
+        let (chain, hit) = {
+            let _stage = observe::stage(observe::Stage::PrefixCache);
+            let chain = PrefixCache::chain(bytes, u64::from(skip_special));
+            let hit = cache.lookup(bytes, &chain);
+            (chain, hit)
+        };
+
+        if let Some(h) = &hit
+            && h.lcp == bytes.len()
+            && h.lcp == h.entry.bytes.len()
+        {
+            cache.touch(h.entry_id());
+            let ids = h.entry.ids.to_vec();
+            cache.count(Outcome::Exact, bytes.len(), bytes.len(), ids.len());
+            return Ok(self.finish_encode(input, ids, add_special_tokens, &timer));
+        }
+
+        let reused = {
+            let _stage = observe::stage(observe::Stage::PrefixCache);
+            hit.as_ref().and_then(|h| {
+                let chosen =
+                    prefix_cache::choose_cut(&h.entry.cuts, h.lcp, added.max_token_len(), |pos| {
+                        added.match_ends_after(bytes, pos, h.lcp)
+                    });
+                let last = prefix_cache::last_shared_cut(&h.entry.cuts, h.lcp);
+                match (chosen, last) {
+                    (None, Some(_)) => cache.note(Event::NoCut),
+                    (Some(k), Some(l)) if k < l => cache.note(Event::CutBackoff),
+                    _ => {}
+                }
+                let k = chosen?;
+                let cut = h.entry.cuts[k];
+                Some((
+                    cut.start as usize,
+                    &h.entry.ids[..cut.ids_before as usize],
+                    &h.entry.cuts[..k],
+                ))
+            })
+        };
+        let (tail_start, prefix_ids, prefix_cuts) = reused.unwrap_or((0, &[], &[]));
+
+        let tail = &input[tail_start..];
+        let (pts, spans) = self.build_pre_tokenized_spans(tail, skip_special, added);
+        if spans.is_empty() {
+            // Plain text (nothing was reused: a cut starts at an added token).
+            // Not counted as a lookup here: on the scanner path the plain-text
+            // cache looks it up again and counts that, so the summed totals
+            // count each input once; on other paths it is counted nowhere.
+            cache.note(Event::BypassPlain);
+            let ids = self.tokenize_pre_tokenized(pts, true)?;
+            return Ok(self.finish_encode(input, ids, add_special_tokens, &timer));
+        }
+        let mut tail_ids = match &self.segment_cache {
+            Some(seg) if pts.splits().len() > 1 => {
+                let ids = self.tokenize_segments_cached(&pts, seg)?;
+                observe::set_path(observe::Path::SegmentsCached);
+                ids
+            }
+            _ => self.tokenize_pre_tokenized(pts, false)?,
+        };
+
+        // Put the added tokens' ids back, recording where each one landed.
+        let mut cuts = Vec::with_capacity(prefix_cuts.len() + spans.len());
+        cuts.extend_from_slice(prefix_cuts);
+        let mut spans_left = spans.iter();
+        for (i, id) in tail_ids.iter_mut().enumerate() {
+            if *id != SPAN_MARKER {
+                continue;
+            }
+            let Some(span) = spans_left.next() else {
+                // A model id equal to the marker: don't cache this input.
+                cache.note(Event::MarkerFallback);
+                return self.encode_inner(input, add_special_tokens, policy);
+            };
+            *id = span.id;
+            let content = tail_start + span.content;
+            cuts.push(Cut {
+                // Never after the token's own text, should a split ever start
+                // a span inside whitespace an earlier token absorbed.
+                start: (tail_start + span.start.min(span.content)) as u32,
+                content: content as u32,
+                content_end: (content + added.token_len(span.id)) as u32,
+                ids_before: (prefix_ids.len() + i) as u32,
+            });
+        }
+        if spans_left.next().is_some() {
+            cache.note(Event::MarkerFallback);
+            return self.encode_inner(input, add_special_tokens, policy);
+        }
+
+        let outcome = if prefix_ids.is_empty() {
+            Outcome::Miss
+        } else {
+            Outcome::Prefix
+        };
+        cache.count(outcome, bytes.len(), tail_start, prefix_ids.len());
+        let mut ids = Vec::with_capacity(prefix_ids.len() + tail_ids.len());
+        ids.extend_from_slice(prefix_ids);
+        ids.extend_from_slice(&tail_ids);
+        {
+            let _stage = observe::stage(observe::Stage::PrefixCache);
+            cache.insert(
+                bytes,
+                ids.as_slice().into(),
+                cuts.into(),
+                chain,
+                hit.as_ref(),
+            );
+        }
+        Ok(self.finish_encode(input, ids, add_special_tokens, &timer))
+    }
+
+    /// Post-process model ids and count the encode that produced them, as
+    /// [`Self::encode_inner`] does (see `observe`).
+    fn finish_encode(
+        &self,
+        input: &str,
+        ids: Vec<u32>,
+        add_special_tokens: bool,
+        timer: &observe::Timer,
+    ) -> Vec<u32> {
+        let ids = {
+            let _stage = observe::stage(observe::Stage::PostProcess);
+            self.post_process(ids, add_special_tokens)
+        };
+        observe::encode_done(input.len(), ids.len(), timer.ns());
+        ids
     }
 
     fn encode_inner(
@@ -1576,6 +1832,8 @@ impl Tokenizer {
     /// Replace the normalizer.
     pub fn set_normalizer(&mut self, normalizer: Option<Normalizer>) {
         self.normalizer = normalizer;
+        // Cached encodings were normalized the old way.
+        self.clear_caches();
     }
 
     pub fn post_process(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
@@ -1738,29 +1996,67 @@ impl Tokenizer {
                         token_id: Some(*id),
                     });
                 }
-                Segment::Text(text) => {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let normalized = match &self.normalizer {
-                        Some(n) => {
-                            let _stage = observe::stage(observe::Stage::Normalize);
-                            n.normalize(text)
-                        }
-                        None => std::borrow::Cow::Borrowed(*text),
-                    };
-                    let start = buffer.len();
-                    buffer.push_str(&normalized);
-                    let end = buffer.len();
-                    splits.push(PtSplit {
-                        range: start..end,
-                        token_id: None,
-                    });
-                }
+                Segment::Text(text) => self.push_normalized(&mut buffer, &mut splits, text),
             }
         }
 
         PreTokenizedString::new(buffer, splits)
+    }
+
+    /// [`Self::build_pre_tokenized_with`] for the prefix cache: also returns
+    /// the spans of the added tokens, whose ids are left as [`SPAN_MARKER`]
+    /// so that their positions in the output can be found.
+    fn build_pre_tokenized_spans(
+        &self,
+        input: &str,
+        skip_special: bool,
+        added: &AddedTokens,
+    ) -> (PreTokenizedString, Vec<TokenSpan>) {
+        let segments = {
+            let _stage = observe::stage(observe::Stage::AddedTokens);
+            added.split_spans(input, skip_special)
+        };
+        let mut spans = Vec::new();
+        if let [SpannedSegment::Text(text)] = segments[..] {
+            return (self.build_pre_tokenized_ordinary(text), spans);
+        }
+
+        let mut buffer = String::with_capacity(input.len());
+        let mut splits = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match seg {
+                SpannedSegment::Token(span) => {
+                    let start = buffer.len();
+                    splits.push(PtSplit {
+                        range: start..start,
+                        token_id: Some(SPAN_MARKER),
+                    });
+                    spans.push(span);
+                }
+                SpannedSegment::Text(text) => self.push_normalized(&mut buffer, &mut splits, text),
+            }
+        }
+        (PreTokenizedString::new(buffer, splits), spans)
+    }
+
+    /// Append `text`, normalized, to `buffer` as a text split.
+    fn push_normalized(&self, buffer: &mut String, splits: &mut Vec<PtSplit>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let normalized = match &self.normalizer {
+            Some(n) => {
+                let _stage = observe::stage(observe::Stage::Normalize);
+                n.normalize(text)
+            }
+            None => std::borrow::Cow::Borrowed(text),
+        };
+        let start = buffer.len();
+        buffer.push_str(&normalized);
+        splits.push(PtSplit {
+            range: start..buffer.len(),
+            token_id: None,
+        });
     }
 
     /// Normalize one input as a single text span, bypassing added vocabulary.
@@ -2636,6 +2932,527 @@ mod local_tests {
         assert_eq!(cached.encode(input).unwrap(), plain.encode(input).unwrap());
     }
 
+    // ── Prefix cache for input with added tokens ────────────────────────
+
+    /// Added tokens that make cutting a prefix delicate: `<|a|>>` extends
+    /// `<|a|>`; `x<|b|>y` starts before `<|b|>` and runs past it; `<|b|>`
+    /// absorbs whitespace on both sides and `<|c|>` on its left, where
+    /// ` <|c|>z` can start.
+    const PREFIX_ADDED: [(&str, bool, bool, bool); 6] = [
+        ("<|a|>", false, false, true),
+        ("<|a|>>", false, false, true),
+        ("<|b|>", true, true, false),
+        ("x<|b|>y", false, false, true),
+        ("<|c|>", true, false, true),
+        (" <|c|>z", false, false, true),
+    ];
+
+    /// A byte-level BPE tokenizer with [`PREFIX_ADDED`] (lstrip, rstrip,
+    /// special) and the given normalizer and pre-tokenizer.
+    fn prefix_test_tokenizer(normalizer: Value, pre_tokenizer: Value) -> Tokenizer {
+        prefix_test_tokenizer_with(&PREFIX_ADDED, normalizer, pre_tokenizer)
+    }
+
+    /// [`prefix_test_tokenizer`] with the added tokens `added`.
+    fn prefix_test_tokenizer_with(
+        added: &[(&str, bool, bool, bool)],
+        normalizer: Value,
+        pre_tokenizer: Value,
+    ) -> Tokenizer {
+        let mut alphabet: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+            .into_iter()
+            .collect();
+        alphabet.sort_unstable();
+        let mut vocab: serde_json::Map<String, Value> = alphabet
+            .iter()
+            .enumerate()
+            .map(|(id, c)| (c.to_string(), json!(id)))
+            .collect();
+        // `e Ġ` and `x Ġ` merge across where `<|c|>` absorbs whitespace, and
+        // `Ġ x` across the start of `x<|b|>y`.
+        let merges = [
+            "Ġ t", "h e", "Ġt he", "i n", "in g", "Ċ Ċ", "Ġ Ġ", "e Ġ", "x Ġ", "Ġ x",
+        ];
+        for merge in merges {
+            let id = vocab.len();
+            vocab.insert(merge.replace(' ', ""), json!(id));
+        }
+        let n = vocab.len();
+        let added: Vec<Value> = added
+            .iter()
+            .enumerate()
+            .map(|(i, &(content, lstrip, rstrip, special))| {
+                json!({"id": n + i, "content": content, "single_word": false, "lstrip": lstrip,
+                       "rstrip": rstrip, "normalized": false, "special": special})
+            })
+            .collect();
+        Tokenizer::from_json(json!({
+            "version": "1.0",
+            "added_tokens": added,
+            "normalizer": normalizer,
+            "pre_tokenizer": pre_tokenizer,
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel"},
+            "model": {"type": "BPE", "vocab": vocab, "merges": merges},
+        }))
+        .unwrap()
+    }
+
+    fn prefix_byte_level() -> Value {
+        json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true})
+    }
+
+    /// Text that forms, breaks and extends [`PREFIX_ADDED`] tokens.
+    const PREFIX_PIECES: [&str; 23] = [
+        "<|a|>",
+        "<|a|>>",
+        "<|b|>",
+        "x<|b|>y",
+        "<|c|>",
+        " <|c|>z",
+        "<|a",
+        "|>",
+        ">",
+        "x",
+        "y",
+        "z",
+        "<",
+        " ",
+        "  ",
+        "\n",
+        "\n\n",
+        "the thing",
+        "hello world ",
+        "the",
+        "é",
+        "中文",
+        "<|im_end|>",
+    ];
+
+    /// A stream of requests that mostly continue an earlier one: each is an
+    /// earlier request (usually the latest) cut at a random char boundary and
+    /// extended with [`PREFIX_PIECES`].
+    fn prefix_test_requests(seed: u64, count: usize) -> Vec<String> {
+        prefix_test_requests_from(seed, count, &PREFIX_PIECES)
+    }
+
+    /// [`prefix_test_requests`] extended with `pieces`.
+    fn prefix_test_requests_from(seed: u64, count: usize, pieces: &[&str]) -> Vec<String> {
+        let mut x = seed;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) as usize
+        };
+        let mut requests: Vec<String> = Vec::new();
+        for _ in 0..count {
+            let mut s = match requests.len() {
+                0 => String::new(),
+                n if next() % 4 == 0 => requests[next() % n].clone(),
+                n => requests[n - 1].clone(),
+            };
+            if !s.is_empty() && next() % 3 != 0 {
+                let mut cut = s.len() - next() % s.len().min(64);
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                s.truncate(cut);
+            }
+            let target = s.len().max(prefix_cache::BLOCK) + next() % 3000;
+            while s.len() < target {
+                s.push_str(pieces[next() % pieces.len()]);
+            }
+            requests.push(s);
+        }
+        requests
+    }
+
+    #[test]
+    fn prefix_cache_matches_uncached_encoding() {
+        let byte_level = |regex: bool| json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": regex});
+        let configs = [
+            ("byte-level regex", Value::Null, byte_level(true)),
+            ("bulk byte-level", Value::Null, byte_level(false)),
+            (
+                "NFC, bulk byte-level",
+                json!({"type": "NFC"}),
+                byte_level(false),
+            ),
+            (
+                "prepend normalizer",
+                json!({"type": "Prepend", "prepend": ">"}),
+                byte_level(true),
+            ),
+        ];
+        for (name, normalizer, pre_tokenizer) in configs {
+            let plain = prefix_test_tokenizer(normalizer.clone(), pre_tokenizer.clone());
+            // The last runs on a budget that evicts by bytes and turns away
+            // inputs over about 20 KB.
+            for (seed, capacity, segments, budget) in [
+                (1, 64, false, None),
+                (2, 2, false, None),
+                (3, 64, true, None),
+                (4, 64, false, Some(64 * 45_000)),
+            ] {
+                let requests = prefix_test_requests(seed, 80);
+                let mut cached = prefix_test_tokenizer(normalizer.clone(), pre_tokenizer.clone());
+                match budget {
+                    Some(max_bytes) => cached.enable_input_cache_with_budget(capacity, max_bytes),
+                    None => cached.enable_input_cache(capacity),
+                }
+                if segments {
+                    cached.enable_segment_cache(1 << 20);
+                }
+                for (i, request) in requests.iter().enumerate() {
+                    for policy in [AddedTokenPolicy::All, AddedTokenPolicy::SkipSpecial] {
+                        assert_eq!(
+                            cached.encode_with_policy(request, true, policy).unwrap(),
+                            plain.encode_with_policy(request, true, policy).unwrap(),
+                            "{name}: seed {seed}, request {i}, {policy:?}"
+                        );
+                    }
+                }
+                // Again, mostly from the cache, and concurrently.
+                let expected: Vec<Vec<u32>> =
+                    requests.iter().map(|r| plain.encode(r).unwrap()).collect();
+                assert_eq!(
+                    cached.encode_batch(&requests, false).unwrap(),
+                    expected,
+                    "{name}: batch"
+                );
+                cached.prefix_cache.as_ref().unwrap().check_invariants();
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_cache_matches_uncached_encoding_on_the_full_scan_split() {
+        // A fourth distinct first byte (`#`) moves the added-token split from
+        // the memchr prefilter to the full automaton scan.
+        let mut added = PREFIX_ADDED.to_vec();
+        added.push(("#t#", false, true, true));
+        let plain = prefix_test_tokenizer_with(&added, Value::Null, prefix_byte_level());
+        assert!(plain.added_tokens().unwrap().uses_full_scan());
+        let mut pieces = PREFIX_PIECES.to_vec();
+        pieces.extend(["#t#", "#t#", "#t", "t#", " #t# ", "#"]);
+        for (seed, capacity, segments) in [(11, 64, false), (12, 2, false), (13, 64, true)] {
+            let mut cached = prefix_test_tokenizer_with(&added, Value::Null, prefix_byte_level());
+            cached.enable_input_cache(capacity);
+            if segments {
+                cached.enable_segment_cache(1 << 20);
+            }
+            for (i, request) in prefix_test_requests_from(seed, 80, &pieces)
+                .iter()
+                .enumerate()
+            {
+                for policy in [AddedTokenPolicy::All, AddedTokenPolicy::SkipSpecial] {
+                    assert_eq!(
+                        cached.encode_with_policy(request, true, policy).unwrap(),
+                        plain.encode_with_policy(request, true, policy).unwrap(),
+                        "seed {seed}, request {i}, {policy:?}"
+                    );
+                }
+            }
+            cached.prefix_cache.as_ref().unwrap().check_invariants();
+        }
+    }
+
+    #[test]
+    fn a_tiny_prefix_cache_budget_is_raised_to_one_mib() {
+        // Below 64 bytes the per-entry limit would be zero and turn every
+        // input away. At 1 MiB it is 16 KiB: room for a ~4 KB input.
+        let mut tok = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        tok.enable_input_cache_with_budget(4, 10);
+        tok.encode(&format!("<|a|>{}<|a|>", "the thing ".repeat(420)))
+            .unwrap();
+        let cache = tok.prefix_cache.as_ref().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.observe_json()["max_bytes"], 1 << 20);
+    }
+
+    #[test]
+    fn prefix_cache_handles_inputs_that_are_strict_prefixes_of_an_entry() {
+        let bulk = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false});
+        let plain = prefix_test_tokenizer(Value::Null, bulk.clone());
+        let mut cached = prefix_test_tokenizer(Value::Null, bulk);
+        cached.enable_input_cache(4);
+        let body = "the thing ".repeat(500);
+        let full = format!("<|c|>{body}x  <|c|>z<|a|>>{body}<|b|>  x<|b|>y{body}<|a|>");
+        // Every end within a few bytes of a token, and some in between.
+        let near_token = |i: usize| {
+            ["<", ">", "x"]
+                .iter()
+                .any(|t| full[i.saturating_sub(8)..(i + 8).min(full.len())].contains(t))
+        };
+        let ends: Vec<usize> = (prefix_cache::BLOCK..full.len())
+            .filter(|&i| full.is_char_boundary(i) && (near_token(i) || i % 997 == 0))
+            .collect();
+        assert!(ends.len() > 50);
+        for (k, &end) in ends.iter().enumerate() {
+            // A cut-off retry of the full input, then the full input again,
+            // and every few ends a shorter input on its own.
+            for text in [&full[..end], &full] {
+                assert_eq!(
+                    cached.encode(text).unwrap(),
+                    plain.encode(text).unwrap(),
+                    "end {end}"
+                );
+            }
+            if k % 7 == 0 {
+                let mut fresh = prefix_test_tokenizer(
+                    Value::Null,
+                    json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}),
+                );
+                fresh.enable_input_cache(4);
+                fresh.encode(&full).unwrap();
+                assert_eq!(
+                    fresh.encode(&full[..end]).unwrap(),
+                    plain.encode(&full[..end]).unwrap()
+                );
+            }
+        }
+        cached.prefix_cache.as_ref().unwrap().check_invariants();
+    }
+
+    #[test]
+    fn prefix_cache_stays_correct_when_threads_replace_and_evict_one_entry() {
+        // A capacity of one: two threads continuing conversations that share
+        // a prompt keep replacing and evicting the same entry.
+        let plain = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        let mut cached = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        cached.enable_input_cache(1);
+        let prompt = format!("<|c|>{}<|a|>", "the thing ".repeat(600));
+        std::thread::scope(|scope| {
+            for t in 0..2 {
+                let (cached, plain, prompt) = (&cached, &plain, &prompt);
+                scope.spawn(move || {
+                    let mut text = prompt.clone();
+                    for i in 0..120 {
+                        if i % 15 == 14 {
+                            // A rewrite back into the history.
+                            text.truncate(prompt.len() + (text.len() - prompt.len()) / 2);
+                            while !text.is_char_boundary(text.len()) {
+                                text.pop();
+                            }
+                        }
+                        text.push_str(&format!("x {t}.{i} <|b|> the thing<|a|>>"));
+                        assert_eq!(
+                            cached.encode(&text).unwrap(),
+                            plain.encode(&text).unwrap(),
+                            "thread {t}, request {i}"
+                        );
+                    }
+                });
+            }
+        });
+        let cache = cached.prefix_cache.as_ref().unwrap();
+        assert_eq!(cache.len(), 1);
+        cache.check_invariants();
+    }
+
+    #[test]
+    fn caches_are_emptied_and_stay_correct_when_the_normalizer_changes() {
+        let prepend = |p: &str| {
+            Normalizer::from_config(
+                serde_json::from_value(json!({"type": "Prepend", "prepend": p})).unwrap(),
+            )
+            .unwrap()
+        };
+        let mut plain = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        let mut cached = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        cached.enable_input_cache(4);
+        cached.enable_segment_cache(1 << 20);
+        let chat = format!("<|a|>{}<|c|>the thing<|a|>", "say hi to ".repeat(500));
+        let short = "<|a|>say hi<|c|>the thing<|a|>";
+        let before: Vec<Vec<u32>> = [&chat[..], short]
+            .iter()
+            .map(|t| cached.encode(t).unwrap())
+            .collect();
+        let segments = |t: &Tokenizer| {
+            t.observe_json()["segment_cache"]["entries"]
+                .as_u64()
+                .unwrap()
+        };
+        assert!(cached.prefix_cache.as_ref().unwrap().len() > 0 && segments(&cached) > 0);
+        for tok in [&mut plain, &mut cached] {
+            tok.set_normalizer(Some(prepend("x")));
+        }
+        // The prefix cache is keyed by raw input bytes, so it must be emptied.
+        // The segment and plain-text caches are keyed by normalized text and
+        // could not return stale ids, but would keep unreachable entries.
+        assert_eq!(cached.prefix_cache.as_ref().unwrap().len(), 0);
+        assert_eq!(segments(&cached), 0);
+        for (text, before) in [&chat[..], short].iter().zip(&before) {
+            let want = plain.encode(text).unwrap();
+            assert_ne!(&want, before, "the normalizer must change the ids");
+            assert_eq!(cached.encode(text).unwrap(), want);
+        }
+
+        // The plain-text cache, on the scanner path.
+        let plain_text = "plain text, the thing\n".repeat(500);
+        let mut scan_plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        let mut scan_cached = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        scan_cached.enable_input_cache(4);
+        let before = scan_cached.encode(&plain_text).unwrap();
+        let input_entries = |t: &Tokenizer| {
+            t.input_cache
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .len()
+        };
+        assert_eq!(input_entries(&scan_cached), 1);
+        for tok in [&mut scan_plain, &mut scan_cached] {
+            tok.set_normalizer(Some(prepend("x")));
+        }
+        assert_eq!(input_entries(&scan_cached), 0);
+        let want = scan_plain.encode(&plain_text).unwrap();
+        assert_ne!(want, before, "the normalizer must change the ids");
+        assert_eq!(scan_cached.encode(&plain_text).unwrap(), want);
+    }
+
+    #[test]
+    fn prefix_cache_matches_uncached_encoding_on_the_scanner_path() {
+        let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        let mut cached = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        cached.enable_input_cache(16);
+        let requests = segment_test_requests(5, &SCAN_SPECIALS);
+        for (i, request) in requests.iter().enumerate() {
+            assert_eq!(
+                cached.encode(request).unwrap(),
+                plain.encode(request).unwrap(),
+                "request {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_cache_reuses_the_previous_request() {
+        let mut tok = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        tok.enable_input_cache(4);
+        let cache = tok.prefix_cache.as_ref().unwrap();
+        let mut conversation = String::new();
+        for turn in 0..6 {
+            conversation.push_str(&format!(
+                "<|c|>user {turn}: {}<|a|>",
+                "the thing ".repeat(500)
+            ));
+            tok.encode(&conversation).unwrap();
+            // One entry per conversation: each request replaces the last.
+            assert_eq!(cache.len(), 1, "turn {turn}");
+        }
+        let chain = PrefixCache::chain(conversation.as_bytes(), 0);
+        let hit = cache.lookup(conversation.as_bytes(), &chain).unwrap();
+        assert_eq!(hit.lcp, conversation.len());
+
+        // Plain text and short input are not cached here.
+        tok.encode(&"the thing ".repeat(1000)).unwrap();
+        tok.encode("<|a|>short").unwrap();
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn prefix_cache_does_not_cut_where_the_new_input_splits_differently() {
+        // Bulk byte-level: a text split is one pretoken, so a merge across a
+        // wrong cut changes the ids.
+        let bulk = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false});
+        let plain = prefix_test_tokenizer(Value::Null, bulk.clone());
+        let body = "the thing ".repeat(600);
+        for (first, second) in [
+            // `x<|b|>y` takes the place of `<|b|>` and the `x` before it.
+            (
+                format!("<|c|>{body}x<|b|>"),
+                format!("<|c|>{body}x<|b|>y tail"),
+            ),
+            // ` <|c|>z` starts in the whitespace `<|c|>` absorbed.
+            (
+                format!("<|a|>{body}x  <|c|>"),
+                format!("<|a|>{body}x  <|c|>z tail"),
+            ),
+            // `<|a|>>` starts where `<|a|>` does, which is harmless.
+            (
+                format!("<|c|>{body}<|a|>"),
+                format!("<|c|>{body}<|a|>>tail"),
+            ),
+            // Whitespace the cached input ends with is absorbed by `<|b|>`.
+            (
+                format!("<|c|>{body}<|a|>  "),
+                format!("<|c|>{body}<|a|>  <|b|>tail"),
+            ),
+        ] {
+            let mut cached = prefix_test_tokenizer(Value::Null, bulk.clone());
+            cached.enable_input_cache(4);
+            assert_eq!(
+                cached.encode(&first).unwrap(),
+                plain.encode(&first).unwrap()
+            );
+            assert_eq!(
+                cached.encode(&second).unwrap(),
+                plain.encode(&second).unwrap(),
+                "{second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_cache_cuts_at_a_token_inside_whitespace_an_rstrip_absorbed() {
+        // More than three distinct first bytes: the full-scan split, which
+        // matches ` <q>` inside the space `<|b|>`'s `rstrip` absorbed and
+        // emits it with a span starting before the end of `<|b|>`'s.
+        let mut added = PREFIX_ADDED.to_vec();
+        added.extend([(" <q>", false, false, true), ("#t#", false, false, true)]);
+        let bulk = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false});
+        let plain = prefix_test_tokenizer_with(&added, Value::Null, bulk.clone());
+        let mut cached = prefix_test_tokenizer_with(&added, Value::Null, bulk);
+        cached.enable_input_cache(4);
+        let body = "the thing ".repeat(600);
+        let first = format!("<|c|>{body}a<|b|> <q>");
+        let second = format!("{first}tail<|a|>");
+        let q = plain.token_to_id(" <q>").unwrap();
+        assert!(plain.encode(&first).unwrap().ends_with(&[q]));
+        // The two spans really overlap.
+        let spans: Vec<TokenSpan> = plain
+            .added_tokens()
+            .unwrap()
+            .split_spans(&first, false)
+            .into_iter()
+            .filter_map(|seg| match seg {
+                SpannedSegment::Token(span) => Some(span),
+                SpannedSegment::Text(_) => None,
+            })
+            .collect();
+        let [.., b, last] = spans[..] else {
+            panic!("expected at least two added tokens")
+        };
+        assert_eq!(last.id, q);
+        assert!(last.start < b.end, "{b:?} {last:?}");
+        for text in [&first, &second] {
+            assert_eq!(cached.encode(text).unwrap(), plain.encode(text).unwrap());
+        }
+    }
+
+    #[test]
+    fn prefix_cache_stays_correct_when_tokens_are_added() {
+        let mut plain = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        let mut cached = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        cached.enable_input_cache(4);
+        let input = format!("<|a|>{}<|d|> now<|a|>", "say hi to ".repeat(500));
+        assert_eq!(
+            cached.encode(&input).unwrap(),
+            plain.encode(&input).unwrap()
+        );
+        for tok in [&mut plain, &mut cached] {
+            tok.add_tokens(&[NewToken::special("<|d|>")]).unwrap();
+        }
+        assert_eq!(
+            cached.encode(&input).unwrap(),
+            plain.encode(&input).unwrap()
+        );
+    }
+
     // ── AddedTokenPolicy ────────────────────────────────────────────────
 
     #[test]
@@ -2934,6 +3751,100 @@ mod local_tests {
                 let me = observe::current_thread();
                 assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
                 assert!(plain.observe_json()["prefix_cache"].is_null());
+            });
+        }
+
+        #[test]
+        fn prefix_cache_counts_chat_template_repeats_reuse_and_misses() {
+            on_fresh_thread(|| {
+                let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                tok.enable_input_cache(4);
+                let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+                let base: String = (0..300)
+                    .map(|i| format!("<|im_start|>user\nline {i}: the thing<|im_end|>\n"))
+                    .collect();
+                let longer = format!("{base}<|im_start|>assistant\nHello<|im_end|>\n");
+                for text in [&base, &base, &longer] {
+                    assert_eq!(tok.encode(text).unwrap(), plain.encode(text).unwrap());
+                }
+                let p = &tok.observe_json()["prefix_cache"];
+                assert_eq!(n(p, &["lookups"]), 3);
+                assert_eq!(n(p, &["misses"]), 1);
+                assert_eq!(n(p, &["exact_hits"]), 1);
+                assert_eq!(n(p, &["prefix_hits"]), 1);
+                assert!(n(p, &["reused_bytes"]) > base.len() as u64);
+                assert_eq!(
+                    n(p, &["lookup_bytes"]),
+                    (2 * base.len() + longer.len()) as u64
+                );
+                // The miss stored `base`, which `longer` then replaced.
+                assert_eq!(n(p, &["entries"]), 1);
+                let me = observe::current_thread();
+                assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
+
+                // Too short for the chat path, and without added tokens.
+                tok.encode("<|im_start|>hi<|im_end|>").unwrap();
+                tok.encode(&"plain text line\n".repeat(400)).unwrap();
+                let p = &tok.observe_json()["prefix_cache"];
+                let c = &p["chat"];
+                // Neither is counted as a lookup here.
+                assert_eq!((n(c, &["lookups"]), n(c, &["misses"])), (3, 1));
+                assert_eq!((n(c, &["bypass_short"]), n(c, &["bypass_plain"])), (1, 1));
+                assert_eq!(
+                    (
+                        n(c, &["inserts"]),
+                        n(c, &["replaced"]),
+                        n(c, &["evicted_entries"])
+                    ),
+                    (2, 1, 0)
+                );
+                assert_eq!(
+                    n(c, &["reused_bytes"]) + n(c, &["encoded_bytes"]),
+                    n(c, &["lookup_bytes"])
+                );
+                // The totals add the plain-text cache's lookup of the plain text.
+                assert_eq!(n(p, &["lookups"]), 4);
+
+                // A normalizer change drops the entry, counted as cleared.
+                tok.set_normalizer(None);
+                let c = &tok.observe_json()["prefix_cache"]["chat"];
+                assert_eq!((n(c, &["entries"]), n(c, &["cleared_entries"])), (0, 1));
+                assert_eq!(
+                    n(c, &["inserts"]),
+                    n(c, &["replaced"]) + n(c, &["evicted_entries"]) + n(c, &["cleared_entries"])
+                );
+            });
+        }
+
+        #[test]
+        fn prefix_cache_counts_cut_backoffs_and_evictions() {
+            on_fresh_thread(|| {
+                let plain = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+                let mut tok = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+                tok.enable_input_cache(2);
+                let body = |w: &str| format!("{w} ").repeat(1500);
+                let inputs = [
+                    // `<|b|>` ends the cached input; the next one turns it
+                    // into part of `x<|b|>y`, so reuse backs off to `<|a|>`.
+                    format!("<|c|>{}<|a|>x<|b|>", body("one")),
+                    format!("<|c|>{}<|a|>x<|b|>y tail", body("one")),
+                    // The only shared token is ruled out the same way.
+                    format!("{}x<|b|>", body("two")),
+                    format!("{}x<|b|>y tail", body("two")),
+                    // A third conversation evicts the oldest of two entries.
+                    format!("<|a|>{}<|a|>", body("three")),
+                ];
+                for text in &inputs {
+                    assert_eq!(tok.encode(text).unwrap(), plain.encode(text).unwrap());
+                }
+                let c = &tok.observe_json()["prefix_cache"]["chat"];
+                assert_eq!(n(c, &["cut_backoffs"]), 1);
+                assert_eq!(n(c, &["no_cut"]), 1);
+                assert_eq!((n(c, &["prefix_hits"]), n(c, &["misses"])), (1, 4));
+                assert_eq!(n(c, &["inserts"]), 5);
+                assert_eq!(n(c, &["evicted_entries"]), 5 - n(c, &["replaced"]) - 2);
+                assert!(n(c, &["evicted_bytes"]) > 0);
+                assert_eq!(n(c, &["entries"]), 2);
             });
         }
     }

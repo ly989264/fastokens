@@ -156,7 +156,8 @@ function render(A, snap) {
       card.innerHTML = `<h2>缓存 · ${esc(name)}</h2><div class="legend">Segment cache</div><div class="kpis seg"></div><canvas></canvas>
         <div class="legend"><i style="background:var(--s0)"></i>分段命中率 <i style="background:var(--s3)"></i>字节命中率</div>
         <div class="legend" style="margin-top:8px">各分片占用（满格 = 该分片预算）</div><div class="bars"></div>
-        <div class="legend" style="margin-top:8px">前缀缓存（FASTOKENS_INPUT_CACHE）</div><div class="kpis pre"></div>`; box.appendChild(card); }
+        <div class="legend" style="margin-top:8px">前缀缓存（FASTOKENS_INPUT_CACHE）</div><div class="kpis pre"></div>
+        <div class="legend" style="margin-top:8px">前缀缓存 · 推理请求（含特殊标记）</div><div class="kpis prechat"></div>`; box.appendChild(card); }
     const S = T.segment_cache, seg = card.querySelector(".seg");
     if (!S) kpis(seg, [["状态", "未开启（FASTOKENS_SEGMENT_CACHE）"], ["扫描器快路径", T.scanner_path ? "是" : "否"]]);
     else {
@@ -175,6 +176,14 @@ function render(A, snap) {
     if (!R) kpis(pre, [["状态", "未开启"]]);
     else kpis(pre, [["条目", `${R.entries}/${R.capacity}`], ["查找", R.lookups ?? "–"], ["完整命中", R.exact_hits ?? "–"], ["前缀复用", R.prefix_hits ?? "–"],
       ["未命中", R.misses ?? "–"], ["复用字节占比", pctf(R.reused_share)], ["复用 token", R.reused_tokens ?? "–"]]);
+    const C = R && R.chat, chat = card.querySelector(".prechat");
+    if (!C) kpis(chat, [["状态", "未开启"]]);
+    else kpis(chat, [["条目", `${C.entries}/${C.capacity}`], ["占用", `${mib(C.bytes)} / ${mib(C.max_bytes)}`], ["查找", C.lookups ?? "–"], ["完整命中", C.exact_hits ?? "–"],
+      ["前缀复用", C.prefix_hits ?? "–"], ["未命中", C.misses ?? "–"], ["复用字节占比", pctf(C.reused_share)], ["复用 token", C.reused_tokens ?? "–"],
+      ["切点回退", C.cut_backoffs ?? "–"], ["无可用切点", C.no_cut ?? "–"], ["短输入/纯文本绕过", C.bypass_short == null ? "–" : `${C.bypass_short}/${C.bypass_plain}`],
+      ["替换", C.replaced ?? "–"], ["淘汰", C.evicted_entries ?? "–", C.evicted_entries ? "warn" : ""],
+      ["过大未存", C.rejected_oversized ?? "–", C.rejected_oversized ? "warn" : ""], ["清空", C.cleared_entries ?? "–"],
+      ["锁等待", C.lock_contended == null ? "–" : `${C.lock_contended} 次 / ${fmt(C.lock_wait_ms, 2)} ms`]]);
   }
 }
 async function tick() {

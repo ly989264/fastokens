@@ -129,6 +129,13 @@ def snapshot(tokenizers=None) -> dict:
 # ── analysis of a window ──────────────────────────────────────────────────────
 
 
+# Counters of the chat-template prefix cache (`prefix_cache.chat`).
+_CHAT_COUNTERS = ("lookups", "exact_hits", "prefix_hits", "misses", "lookup_bytes", "reused_bytes",
+                  "reused_tokens", "encoded_bytes", "cut_backoffs", "no_cut", "bypass_short", "bypass_plain",
+                  "marker_fallbacks", "inserts", "replaced", "evicted_entries", "evicted_bytes",
+                  "rejected_oversized", "rejected_bytes", "cleared_entries", "lock_contended", "lock_wait_ns")
+
+
 def _d(a, b):
     """b - a for numbers and numeric lists, recursively for dicts."""
     if isinstance(b, dict):
@@ -293,6 +300,16 @@ def analyze(prev: dict, cur: dict) -> dict:
                 pc.update(lookups=dp["lookups"], exact_hits=dp["exact_hits"], prefix_hits=dp["prefix_hits"],
                           misses=dp["misses"], reused_bytes=dp["reused_bytes"], reused_tokens=dp["reused_tokens"],
                           reused_share=_div(dp["reused_bytes"], dp["lookup_bytes"]))
+            c1 = p1c.get("chat")
+            if c1:
+                # The chat-template (inference) path on its own.
+                ch = {k: c1[k] for k in ("entries", "capacity", "max_bytes", "bytes", "index_blocks")}
+                if "lookups" in c1:
+                    dc = _d((t0.get("prefix_cache") or {}).get("chat") or {}, c1)
+                    ch.update({k: dc[k] for k in _CHAT_COUNTERS})
+                    ch.update(reused_share=_div(dc["reused_bytes"], dc["lookup_bytes"]),
+                              lock_wait_ms=dc["lock_wait_ns"] / 1e6)
+                pc["chat"] = ch
             entry["prefix_cache"] = pc
         toks[name] = entry
     out["tokenizers"] = toks
@@ -371,6 +388,21 @@ def report(prev: dict, cur: dict, slowest: int = 5) -> str:
                 line += (f"; {p['lookups']} lookups: {p['exact_hits']} exact, {p['prefix_hits']} prefix, {p['misses']} misses; "
                          f"reused {_fmt(p['reused_share'], '.1%')} of input bytes ({p['reused_tokens']} tokens)")
             L.append(line)
+            c = p.get("chat")
+            if c:
+                line = (f"  prefix cache (chat) [{name}]: {c['entries']}/{c['capacity']} entries, "
+                        f"{c['bytes'] / 2**20:.1f}/{c['max_bytes'] / 2**20:.0f} MiB, {c['index_blocks']} index blocks")
+                if "lookups" in c:
+                    line += (f"; {c['lookups']} lookups: {c['exact_hits']} exact, {c['prefix_hits']} prefix, "
+                             f"{c['misses']} misses; reused {_fmt(c['reused_share'], '.1%')} of input bytes "
+                             f"({c['reused_tokens']} tokens)")
+                L.append(line)
+                if "lookups" in c:
+                    L.append(f"    cut backoffs {c['cut_backoffs']}, no cut {c['no_cut']}, bypassed {c['bypass_short']} short "
+                             f"/ {c['bypass_plain']} plain, marker fallbacks {c['marker_fallbacks']}; inserts {c['inserts']}, "
+                             f"replaced {c['replaced']}, evicted {c['evicted_entries']} ({c['evicted_bytes'] / 2**20:.2f} MiB), "
+                             f"rejected too large {c['rejected_oversized']}, cleared {c['cleared_entries']}; "
+                             f"lock waits {c['lock_contended']} ({c['lock_wait_ms']:.2f} ms)")
     L.append("")
     L.append(f"{'thread':28} {'kind':7} {'busy':>6} {'in API':>7} {'enc/s':>8} {'tasks/s':>8}  main path")
     for t in a["threads"]:
@@ -530,6 +562,16 @@ def prometheus(snap: dict) -> str:
             m("fastokens_prefix_cache_entries", pc["entries"], lab, "gauge", "prefix cache entries")
             for key in ("lookups", "exact_hits", "prefix_hits", "misses", "lookup_bytes", "reused_bytes", "reused_tokens"):
                 m(f"fastokens_prefix_cache_{key}_total", pc.get(key), lab, help_=f"prefix cache {key}")
+            ch = pc.get("chat")
+            if ch:
+                for key in ("entries", "bytes", "max_bytes", "index_blocks"):
+                    m(f"fastokens_prefix_cache_chat_{key}", ch[key], lab, "gauge", f"chat prefix cache {key}")
+                for key in _CHAT_COUNTERS:
+                    if key == "lock_wait_ns":
+                        m("fastokens_prefix_cache_chat_lock_wait_seconds_total", ch.get(key, 0) / 1e9, lab,
+                          help_="time waiting for the chat prefix cache lock")
+                    elif key in ch:
+                        m(f"fastokens_prefix_cache_chat_{key}_total", ch[key], lab, help_=f"chat prefix cache {key}")
     return "\n".join(out) + "\n"
 
 

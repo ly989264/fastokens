@@ -49,6 +49,24 @@ pub enum Segment<'a> {
     Text(&'a str),
 }
 
+/// An added-token match with its position in the input: `start..end` is the
+/// whole span, including whitespace absorbed by `lstrip`/`rstrip`, and the
+/// token's own text starts at `content`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TokenSpan {
+    pub id: u32,
+    pub start: usize,
+    pub content: usize,
+    pub end: usize,
+}
+
+/// A [`Segment`] whose added tokens carry their [`TokenSpan`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpannedSegment<'a> {
+    Token(TokenSpan),
+    Text(&'a str),
+}
+
 /// Public view of one added-token entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddedTokenInfo<'a> {
@@ -202,6 +220,63 @@ impl AddedTokens {
     /// what HuggingFace `tokenizers` does under `encode_special_tokens`, which
     /// `transformers` sets for `split_special_tokens=True`.
     pub fn split_with<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
+        let mut segments = Vec::new();
+        self.split_each(input, skip_special, |seg| {
+            segments.push(match seg {
+                SpannedSegment::Token(span) => Segment::Token(span.id),
+                SpannedSegment::Text(text) => Segment::Text(text),
+            })
+        });
+        segments
+    }
+
+    /// Whether splits scan with the full automaton rather than a `memchr`
+    /// prefilter (more than three distinct first bytes).
+    #[cfg(test)]
+    pub(crate) fn uses_full_scan(&self) -> bool {
+        self.start_bytes.len() > 3
+    }
+
+    /// [`Self::split_with`], keeping each added token's position in `input`.
+    pub(crate) fn split_spans<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+    ) -> Vec<SpannedSegment<'a>> {
+        let mut segments = Vec::new();
+        self.split_each(input, skip_special, |seg| segments.push(seg));
+        segments
+    }
+
+    /// Longest added token in bytes.
+    pub(crate) fn max_token_len(&self) -> usize {
+        self.max_token_len
+    }
+
+    /// Length in bytes of added token `id`'s text (0 for other ids).
+    pub(crate) fn token_len(&self, id: u32) -> usize {
+        self.token_lens.get(id as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether an added token matching `bytes` at `pos` ends after `limit`.
+    ///
+    /// Matching is leftmost-longest, so only the longest token starting at
+    /// `pos` can be taken there, and it is the one checked.
+    pub(crate) fn match_ends_after(&self, bytes: &[u8], pos: usize, limit: usize) -> bool {
+        let window = &bytes[pos..(pos + self.max_token_len).min(bytes.len())];
+        self.daac
+            .leftmost_find_iter(window)
+            .next()
+            .is_some_and(|m| m.start() == 0 && pos + m.end() > limit)
+    }
+
+    /// Run the split, handing each segment to `emit` in order.
+    fn split_each<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+        emit: impl FnMut(SpannedSegment<'a>),
+    ) {
         // When there are few distinct start bytes, use SIMD memchr to skip
         // positions that cannot start any added token. This avoids scanning
         // the full input through the Aho-Corasick automaton.
@@ -210,11 +285,13 @@ impl AddedTokens {
                 input,
                 memchr::memchr_iter(self.start_bytes[0], input.as_bytes()),
                 skip_special,
+                emit,
             ),
             2 => self.split_prefilter(
                 input,
                 memchr::memchr2_iter(self.start_bytes[0], self.start_bytes[1], input.as_bytes()),
                 skip_special,
+                emit,
             ),
             3 => self.split_prefilter(
                 input,
@@ -225,8 +302,9 @@ impl AddedTokens {
                     input.as_bytes(),
                 ),
                 skip_special,
+                emit,
             ),
-            _ => self.split_full_scan(input, skip_special),
+            _ => self.split_full_scan(input, skip_special, emit),
         }
     }
 
@@ -236,8 +314,8 @@ impl AddedTokens {
         input: &'a str,
         candidates: impl Iterator<Item = usize>,
         skip_special: bool,
-    ) -> Vec<Segment<'a>> {
-        let mut segments = Vec::new();
+        mut emit: impl FnMut(SpannedSegment<'a>),
+    ) {
         let mut prev_end = 0;
         // End of the last match, emitted or not. A skipped special token still
         // consumes its span, so a candidate inside it cannot start a second
@@ -265,22 +343,22 @@ impl AddedTokens {
                 let (start, end) =
                     self.strip_bounds(input, m.value(), pos, pos + m.end(), prev_end);
                 if start > prev_end {
-                    segments.push(Segment::Text(&input[prev_end..start]));
+                    emit(SpannedSegment::Text(&input[prev_end..start]));
                 }
-                segments.push(Segment::Token(m.value()));
+                emit(SpannedSegment::Token(TokenSpan {
+                    id: m.value(),
+                    start,
+                    content: pos,
+                    end,
+                }));
                 prev_end = end;
                 scan_from = end;
             }
         }
 
         if prev_end < input.len() {
-            segments.push(Segment::Text(&input[prev_end..]));
+            emit(SpannedSegment::Text(&input[prev_end..]));
         }
-        if segments.is_empty() && !input.is_empty() {
-            segments.push(Segment::Text(input));
-        }
-
-        segments
     }
 
     /// Expand a match span to absorb adjacent Unicode whitespace per the
@@ -323,8 +401,12 @@ impl AddedTokens {
     }
 
     /// Full-scan fallback for >3 distinct start bytes.
-    fn split_full_scan<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
-        let mut segments = Vec::new();
+    fn split_full_scan<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+        mut emit: impl FnMut(SpannedSegment<'a>),
+    ) {
         let mut prev_end = 0;
 
         for m in self.daac.leftmost_find_iter(input) {
@@ -333,17 +415,20 @@ impl AddedTokens {
             }
             let (start, end) = self.strip_bounds(input, m.value(), m.start(), m.end(), prev_end);
             if start > prev_end {
-                segments.push(Segment::Text(&input[prev_end..start]));
+                emit(SpannedSegment::Text(&input[prev_end..start]));
             }
-            segments.push(Segment::Token(m.value()));
+            emit(SpannedSegment::Token(TokenSpan {
+                id: m.value(),
+                start,
+                content: m.start(),
+                end,
+            }));
             prev_end = end;
         }
 
         if prev_end < input.len() {
-            segments.push(Segment::Text(&input[prev_end..]));
+            emit(SpannedSegment::Text(&input[prev_end..]));
         }
-
-        segments
     }
 }
 

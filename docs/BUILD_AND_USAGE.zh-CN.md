@@ -152,7 +152,8 @@ FASTOKENS_SEGMENT_CACHE=1024 python -c "import fastokens; fastokens.patch_transf
 | 环境变量 / 接口 | 作用 | 默认 |
 |---|---|---|
 | `FASTOKENS_SEGMENT_CACHE=<MiB>` | 开启段缓存，数值是内存上限（缓存的文本加 token id）。Rust 中对应 `Tokenizer::enable_segment_cache(bytes)` | 关闭 |
-| `FASTOKENS_INPUT_CACHE=<条数>` | 原有的前缀缓存。只对不含特殊标记的纯文本、且切词规则为 o200k / Kimi 类的输入有效，对 chat template 输出不起作用 | 关闭 |
+| `FASTOKENS_INPUT_CACHE=<条数>` | 前缀缓存，数值是保留的最近输入条数，建议取并发会话数的 1.5–2 倍。chat template 输出（含特殊标记）会找与它共享最长字节前缀的缓存输入，复用到共享部分里最后一个特殊标记为止；新请求是同一会话的延续时替换那一条，只和它共享系统提示的其他会话不替换。每条约占输入文本的 2.2 倍（文本加每 token 4 字节）。不含特殊标记的纯文本沿用原有逻辑（仅 o200k / Kimi 类切词规则），只受条数限制。与段缓存同时开启时，前缀之后的部分再走段缓存。Rust 中对应 `Tokenizer::enable_input_cache(capacity)` | 关闭 |
+| `FASTOKENS_INPUT_CACHE_MIB=<MiB>` | 前缀缓存（推理请求部分）的内存上限：条数或字节数任一超限就淘汰最久没用的条目；单条超过上限 1/64 的输入不缓存。预算按每个 Tokenizer 实例计：两种缓存都开时，单个实例最多占两者之和（默认 2048 MiB 加段缓存的预算）；vLLM 这类分词器拷贝池里每份拷贝各占一份。Rust 中对应 `Tokenizer::enable_input_cache_with_budget(capacity, bytes)`，小于 1 MiB 按 1 MiB 算 | 2048 |
 | `FASTOKENS_BPE_THREADS=<数量>` | 单个请求内部并行使用的线程数 | 全部逻辑核（Apple Silicon 上为性能核数） |
 | 释放 GIL | `encode`、`encode_ordinary`、`encode_segments`、`encode_batch` 在输入 ≥16 KB 时自动释放 | 始终开启 |
 | 带标记请求走快速切词器 | 对 o200k / Kimi 类切词规则自动生效 | 始终开启 |

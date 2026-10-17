@@ -80,7 +80,7 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
 
 /// Map hasher for keys that are already [`hash_bytes`] outputs.
 #[derive(Default)]
-struct PassThrough(u64);
+pub(crate) struct PassThrough(u64);
 
 impl Hasher for PassThrough {
     fn finish(&self) -> u64 {
@@ -96,7 +96,7 @@ impl Hasher for PassThrough {
     }
 }
 
-type HashMapU64<V> = HashMap<u64, V, BuildHasherDefault<PassThrough>>;
+pub(crate) type HashMapU64<V> = HashMap<u64, V, BuildHasherDefault<PassThrough>>;
 
 struct Entry {
     text: Box<[u8]>,
