@@ -1,21 +1,23 @@
-
 name: Build fastokens for A3
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   build-a3:
-    name: Linux ARM64 Wheel
+    name: Linux ARM64 Wheel (${{ matrix.variant }})
     runs-on: ubuntu-22.04
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            features: ""
+          - variant: observe
+            features: --features observe
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v6
       - name: Build Wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -26,6 +28,7 @@ jobs:
             --locked
             --out dist
             -i python3.12
+            ${{ matrix.features }}
           sccache: "false"
           before-script-linux: |
             if command -v yum >/dev/null 2>&1; then
@@ -37,7 +40,6 @@ jobs:
               echo "Unsupported build environment"
               exit 1
             fi
-
       - name: Verify Wheel
         shell: bash
         run: |
@@ -46,31 +48,69 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile
-
           wheels = list(Path("dist").glob("*.whl"))
           assert len(wheels) == 1, wheels
           wheel = wheels[0]
-
-          assert (
-              "cp39-abi3-manylinux_2_28_aarch64.whl"
-              in wheel.name
-          ), wheel.name
-
+          assert ("cp39-abi3-manylinux_2_28_aarch64.whl" in wheel.name), wheel.name
           with ZipFile(wheel) as archive:
               names = archive.namelist()
-              assert any(
-                  name.startswith("fastokens/_native")
-                  and name.endswith(".so")
-                  for name in names
-              ), "Native extension missing"
-
+              assert any(name.startswith("fastokens/_native") and name.endswith(".so") for name in names), "Native extension missing"
           print("Wheel structure verified:", wheel.name)
           PY
-
       - name: Upload Wheel
         uses: actions/upload-artifact@v4
         with:
-          name: fastokens-a3-${{ github.sha }}
+          name: fastokens-a3-${{ matrix.variant }}-${{ github.sha }}
           path: dist/*.whl
           if-no-files-found: error
 
+  smoke-a3:
+    name: Smoke Test on ARM64 (${{ matrix.variant }})
+    needs: build-a3
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, observe]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Download Wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: fastokens-a3-${{ matrix.variant }}-${{ github.sha }}
+          path: dist
+      - name: Install Wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install dist/*.whl
+          python -m pip show fastokens
+      - name: Encode With and Without Caches
+        shell: bash
+        # Run outside the checkout so `import fastokens` finds the installed wheel.
+        working-directory: ${{ runner.temp }}
+        run: python "$GITHUB_WORKSPACE/.github/scripts/a3_smoke.py" --variant ${{ matrix.variant }}
+      - name: Install perf
+        id: perf
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)"
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          perf --version
+      - name: Sample With perf
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          if [ "${{ steps.perf.outcome }}" != "success" ]; then
+            echo "::warning::perf could not be installed on this runner; the sampler check runs without it"
+          fi
+          python "$GITHUB_WORKSPACE/.github/scripts/a3_smoke.py" --variant ${{ matrix.variant }} --perf
