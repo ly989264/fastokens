@@ -30,18 +30,6 @@ step "cargo clippy -- -D warnings" clippy.log cargo clippy -- -D warnings
 step "cargo clippy --features observe -- -D warnings" clippy-obs.log cargo clippy --features observe -- -D warnings
 step "cargo test --release" test.log cargo test --release; tests_line "$OUT/test.log"
 step "cargo test --release --features observe" test-obs.log cargo test --release --features observe; tests_line "$OUT/test-obs.log"
-for repo in zai-org/GLM-5.3 deepseek-ai/DeepSeek-V4.1-Flash Qwen/Qwen3-Coder-30B-A3B-Instruct; do
-  tj=$($PY -c "from huggingface_hub import hf_hub_download as d; print(d('$repo', 'tokenizer.json'))" 2>/dev/null)
-  n=$(basename "$repo")
-  if [ -z "$tj" ]; then note "[SKIP] prefix fuzz $n (tokenizer.json not available)"; continue; fi
-  for strip in 0 1; do
-    step "prefix fuzz $n strip=$strip ${FUZZ_SECS}s" "fuzz-$n-$strip.log" \
-      env FUZZ_TOKENIZER="$tj" FUZZ_SECS="$FUZZ_SECS" FUZZ_SEED=1 FUZZ_STRIP=$strip \
-      cargo test --release --test prefix_cache_fuzz -- --ignored --nocapture
-    grep -iE "requests|mismatch|compared" "$OUT/fuzz-$n-$strip.log" | tail -2 | sed 's/^/    /' | tee -a "$SUM"
-  done
-done
-
 # 2. wheels and pytest
 DEPS=("pytest==9.1.1" "tokenizers==0.22.2" "transformers==5.12.1" "tiktoken==0.14.0" "huggingface-hub==1.33.0" numpy psutil jinja2 "maturin>=1,<2")
 for v in default observe; do
@@ -55,6 +43,25 @@ for v in default observe; do
   tail -1 "$OUT/pytest-$v.log" | sed 's/^/    /' | tee -a "$SUM"
   grep "^FAILED" "$OUT/pytest-$v.log" | sed 's/^/    /' | tee -a "$SUM"
 done
+
+# 1b. prefix cache fuzz (needs huggingface_hub from the venv)
+for repo in zai-org/GLM-5.3 deepseek-ai/DeepSeek-V4.1-Flash Qwen/Qwen3-Coder-30B-A3B-Instruct; do
+  tj=$("$OUT/venv-default/bin/python" -c "from huggingface_hub import hf_hub_download as d; print(d('$repo', 'tokenizer.json'))" 2>/dev/null)
+  n=$(basename "$repo")
+  if [ -z "$tj" ]; then note "[SKIP] prefix fuzz $n (tokenizer.json not available)"; continue; fi
+  for strip in 0 1; do
+    step "prefix fuzz $n strip=$strip ${FUZZ_SECS}s" "fuzz-$n-$strip.log" \
+      env FUZZ_TOKENIZER="$tj" FUZZ_SECS="$FUZZ_SECS" FUZZ_SEED=1 FUZZ_STRIP=$strip \
+      cargo test --release --test prefix_cache_fuzz -- --ignored --nocapture
+    grep -iE "requests|mismatch|compared" "$OUT/fuzz-$n-$strip.log" | tail -2 | sed 's/^/    /' | tee -a "$SUM"
+  done
+done
+
+
+# 2b. encode vs mutators, each method in its own process (the pytest version passes >128 KiB in one
+#     argv string, which Linux rejects)
+step "encode vs mutators race, per method (default wheel)" deadlock.log "$OUT/venv-default/bin/python" lt/deadlock_check.py --seconds 3 --timeout 60
+sed "s/^/    /" "$OUT/deadlock.log" | grep -E "race vs mutators" | tee -a "$SUM"
 
 # 3. cache consistency on real models (vs HF tokenizers / tiktoken)
 V=$OUT/venv-default/bin/python
