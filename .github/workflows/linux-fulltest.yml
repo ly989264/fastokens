@@ -1,5 +1,9 @@
 name: Linux full functional test
 on:
+  # workflow_dispatch alone cannot be started while the file is not on the
+  # default branch, so this temporary branch also runs it on its own pushes.
+  push:
+    branches: [build/linux-fulltest]
   workflow_dispatch:
 permissions:
   contents: read
