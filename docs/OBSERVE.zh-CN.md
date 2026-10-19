@@ -253,4 +253,4 @@ layers: 0.926 ms/call = outside the API calls 0.351 + building Python lists 0.28
 - 线程表最多记 255 个线程，之后的合并为"(other threads)"。
 - p50/p99 来自 log2 直方图，显示的是所在桶的上界。
 - 仪表盘只监听 127.0.0.1，没有鉴权；不要暴露到公网。
-- CPU 采样：macOS 的 `sample` 会采到所有线程，包括阻塞的线程，所以报告把阻塞类单独列出；`swtch_pri` 这类让出 CPU 的自旋算作"在 CPU 上"。原生采样看不到 Python 函数名。Rust 符号不解码，按名字里的模块名识别，泛型实例化的名字里同时出现多个阶段时归入 "Rust: other"。Linux 的 `perf` 把 PCRE2 即时编译出的正则代码显示为 `[unknown]`（`perf-<pid>.map`），目前归入 other：A3 冒烟测试的编码循环里约占三分之一，实际属于正则引擎（macOS 上这类帧算给调用方，归入正则引擎）。
+- CPU 采样：macOS 的 `sample` 会采到所有线程，包括阻塞的线程，所以报告把阻塞类单独列出；`swtch_pri` 这类让出 CPU 的自旋算作"在 CPU 上"。原生采样看不到 Python 函数名。Rust 符号不解码，按名字里的模块名识别，泛型实例化的名字里同时出现多个阶段时归入 "Rust: other"。Linux 的 `perf` 把 PCRE2 即时编译出的正则代码显示为 `[unknown]`（`perf-<pid>.map`），目前归入 other：A3 冒烟测试的编码循环里占 35–40%（4 次采样），其中大部分实际属于正则引擎（macOS 上这类帧算给调用方，归入正则引擎）。
