@@ -1,0 +1,46 @@
+name: Linux full functional test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fulltest:
+    name: Full functional test (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install perf
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)"
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          perf --version
+      - name: Run the tests
+        run: PY=python FUZZ_SECS=30 bash lt/run.sh "$RUNNER_TEMP/lt" || true
+      - name: Summary
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/lt/summary.txt"
+          { echo '```'; cat "$RUNNER_TEMP/lt/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-fulltest-logs
+          path: |
+            ${{ runner.temp }}/lt/*.log
+            ${{ runner.temp }}/lt/summary.txt
+            ${{ runner.temp }}/lt/tools-*/*.txt
