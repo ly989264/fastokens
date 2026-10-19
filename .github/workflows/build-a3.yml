@@ -17,7 +17,7 @@ jobs:
             features: --features observe
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Build Wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -74,9 +74,9 @@ jobs:
         variant: [default, observe]
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Download Wheel
