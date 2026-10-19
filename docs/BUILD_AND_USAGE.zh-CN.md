@@ -179,6 +179,8 @@ python -c "import fastokens, fastokens.observe as o; print(fastokens.__file__); 
 
 ## 3. 使用
 
+从零开始开启段缓存、前缀缓存和使用分析功能（含 vLLM 里的用法）的完整步骤，见 [`OPERATIONS.zh-CN.md`](OPERATIONS.zh-CN.md)。
+
 ### 3.1 直接调用
 
 ```python

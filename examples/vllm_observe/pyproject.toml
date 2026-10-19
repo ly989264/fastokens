@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-fastokens-observe"
+version = "0.1.0"
+description = "vLLM general plugin: serve the fastokens observe dashboard from every vLLM process that tokenizes"
+requires-python = ">=3.9"
+dependencies = ["fastokens"]
+
+[project.entry-points."vllm.general_plugins"]
+fastokens_observe = "vllm_fastokens_observe:register"
+
+[tool.setuptools]
+packages = ["vllm_fastokens_observe"]
