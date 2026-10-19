@@ -9,7 +9,7 @@
 - Python API 调用的时间分别花在 Rust、等 GIL 和 Python 哪一部分。
 
 另有两个从外部看 fastokens 的工具（第 3.4、3.5 节）：
-- **CPU 采样**（`python -m fastokens.observe sample`，任何构建都能用）：用系统自带的采样器（macOS 的 `sample`；Linux 的 `perf`，**未在 Linux 上验证**）对一个进程采样，把每个样本归到流水线阶段、分配器、memcpy、哈希、正则引擎、线程池、GIL、Python 解释器等类别，并输出可直接画火焰图的折叠栈。也能分析 HF `tokenizers` 的栈，便于对照。
+- **CPU 采样**（`python -m fastokens.observe sample`，任何构建都能用）：用系统自带的采样器（macOS 的 `sample`；Linux 的 `perf`，已在 GitHub 的 arm64 Linux 机器上验证）对一个进程采样，把每个样本归到流水线阶段、分配器、memcpy、哈希、正则引擎、线程池、GIL、Python 解释器等类别，并输出可直接画火焰图的折叠栈。也能分析 HF `tokenizers` 的栈，便于对照。
 - **分层拆分**（`python -m fastokens.observe layers`，需要 observe 构建）：把一次调用拆成"fastokens 之外（调用方、transformers 包装层）/ 绑定层 Python 侧 / 等 GIL / 建 Python 列表 / Rust 各阶段"。
 
 关闭时，所有埋点都是空函数，或者是零大小、不带析构的类型，编译出来的代码和原来一样。
@@ -131,7 +131,7 @@ s = obs.sample("prof", pid=12345, seconds=10)   # 返回汇总 dict；s["report"
 ```
 
 - 输出：`prof.txt`（文字报告）、`prof.json`（汇总）、`prof.folded`（折叠栈，每行 `线程;帧;…;帧 次数`，可直接交给 FlameGraph 的 `flamegraph.pl` 或 speedscope 画火焰图）、`prof.raw.txt`（采样器的原始输出）。
-- 采样器：macOS 用系统自带的 `/usr/bin/sample`（每 1 ms 一次，不需要权限，不需要安装任何东西）；Linux 用 `perf record -g` + `perf script`，需要装 `perf` 并有权限（`kernel.perf_event_paranoid ≤ 1` 或 root）。**Linux 这条路径没有在 Linux 上验证过。** 两者都没有时会明确报错。
+- 采样器：macOS 用系统自带的 `/usr/bin/sample`（每 1 ms 一次，不需要权限，不需要安装任何东西）；Linux 用 `perf record -g` + `perf script`，需要装 `perf` 并有权限（`kernel.perf_event_paranoid ≤ 1` 或 root）。Linux 这条路径在 GitHub 的 ubuntu-24.04-arm 机器（perf 6.17）上由 A3 冒烟测试验证过（见 `BUILD_AND_USAGE.zh-CN.md` 2.5 节）。两者都没有时会明确报错。
 - 采样本进程时，`sample()` 会阻塞 `seconds` 秒，负载要放在另一个线程里跑。
 
 **怎么归类**：每个样本按栈顶函数（自身时间）归类；分配、memcpy、哈希、正则这类通用函数，还会再记一笔"是哪个流水线阶段调用的"（报告里的 "called from"）。
@@ -253,4 +253,4 @@ layers: 0.926 ms/call = outside the API calls 0.351 + building Python lists 0.28
 - 线程表最多记 255 个线程，之后的合并为"(other threads)"。
 - p50/p99 来自 log2 直方图，显示的是所在桶的上界。
 - 仪表盘只监听 127.0.0.1，没有鉴权；不要暴露到公网。
-- CPU 采样：macOS 的 `sample` 会采到所有线程，包括阻塞的线程，所以报告把阻塞类单独列出；`swtch_pri` 这类让出 CPU 的自旋算作"在 CPU 上"。原生采样看不到 Python 函数名。Rust 符号不解码，按名字里的模块名识别，泛型实例化的名字里同时出现多个阶段时归入 "Rust: other"。Linux 的 `perf` 路径未验证。
+- CPU 采样：macOS 的 `sample` 会采到所有线程，包括阻塞的线程，所以报告把阻塞类单独列出；`swtch_pri` 这类让出 CPU 的自旋算作"在 CPU 上"。原生采样看不到 Python 函数名。Rust 符号不解码，按名字里的模块名识别，泛型实例化的名字里同时出现多个阶段时归入 "Rust: other"。Linux 的 `perf` 把 PCRE2 即时编译出的正则代码显示为 `[unknown]`（`perf-<pid>.map`），目前归入 other：A3 冒烟测试的编码循环里占 35–40%（4 次采样），其中大部分实际属于正则引擎（macOS 上这类帧算给调用方，归入正则引擎）。

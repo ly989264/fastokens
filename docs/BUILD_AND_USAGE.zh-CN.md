@@ -112,6 +112,71 @@ python -c "import fastokens; print(fastokens.__file__)"
 pytest python/tests
 ```
 
+### 2.5 在 GitHub 上编译
+
+不想在本机装 Rust，或要给其他架构的机器（如 A3 的 aarch64 Linux）用时，可以直接用 GitHub Actions 编好的 wheel。下面的 `gh` 命令在仓库目录里运行；在别处运行时加 `--repo ly989264/fastokens`。编好的文件（artifact）保留 90 天。
+
+**普通版：每次推到 main 自动编译。** `Build and Release fastokens`（`.github/workflows/build-release-fastokens.yml`）在推到 main、且改动涉及 `python/`、`src/`、`Cargo.toml`、`Cargo.lock` 或 `.github/workflows/` 时自动运行（只改文档不会运行），编出各平台的 wheel，名字是 `wheels-<系统>-<架构>`，例如 `wheels-linux-aarch64`、`wheels-linux-x86_64`、`wheels-macos-aarch64`。先找到 main 上最近一次运行的编号：
+
+```bash
+gh run list --workflow build-release-fastokens.yml --branch main --limit 5
+```
+
+再下载需要的平台（`<run-id>` 换成上一步输出中 ID 一列的数字）：
+
+```bash
+gh run download <run-id> -n wheels-linux-aarch64 -D dist
+```
+
+**A3 版：手动触发，普通版和观测版各编一个。** `Build fastokens for A3`（`.github/workflows/build-a3.yml`）只能手动触发，编出 aarch64 Linux（manylinux_2_28，Python 3.9 及以上通用）的两个 wheel，再在 GitHub 的 arm64 机器上用 Python 3.12 装上各跑一遍冒烟测试：observe 开关与变体相符；段缓存、前缀缓存分别开和同时开时，带特殊标记的多轮输入逐 token 与不开缓存一致；观测版还要能做分层拆分和快照；最后试一次 `observe sample` 的 Linux `perf` 采样（装不上 perf 只给警告，不算失败）。触发 main 上的版本：
+
+```bash
+gh workflow run build-a3.yml --ref main
+```
+
+触发只是让 GitHub 读取这个分支的代码来编译，不会改动 main，也不会发布到 PyPI。要编其他分支，把 `--ref` 换成分支名。触发后找到这次运行的编号，等它跑完：
+
+```bash
+gh run list --workflow build-a3.yml --limit 3
+```
+
+```bash
+gh run watch <run-id>
+```
+
+两个变体的名字分别是 `fastokens-a3-default-<提交号>` 和 `fastokens-a3-observe-<提交号>`（提交号是完整的 40 位）。按变体下载：
+
+```bash
+gh run download <run-id> -p 'fastokens-a3-observe-*' -D dist-a3
+```
+
+wheel 在 `dist-a3/fastokens-a3-observe-<提交号>/` 里。在 A3 机器的 Python 环境里安装（已装过其他版本时会被替换）：
+
+```bash
+python -m pip install --force-reinstall dist-a3/fastokens-a3-observe-*/fastokens-*.whl
+```
+
+**两个变体的区别和选法：**
+
+| | 普通版（default） | 观测版（observe） |
+|---|---|---|
+| 编译参数 | 无 | `--features observe` |
+| 编码结果 | 一样 | 一样 |
+| `fastokens.observe.enabled()` | `False`：接口都能调用，但只有缓存大小等基础信息 | `True`：各阶段耗时、缓存命中与淘汰、Python 接口的 Rust / 等 GIL / Python 拆分、最慢的请求 |
+| `observe.layers()`（分层拆分） | 不可用 | 可用 |
+| `observe sample`（CPU 采样） | 可用 | 可用 |
+| 什么时候用 | 正式部署 | 要查清时间花在哪、缓存是否起作用时 |
+
+观测版的开销测不出来：在同一台机器上与普通版交替测 5 轮（GLM-5.3 agent 流量，开关缓存 × 1 / 4 个线程），差别在 −0.7% 到 +1.5% 之间，属于测量波动（详见 [`OBSERVE.zh-CN.md`](OBSERVE.zh-CN.md)）。所以排查问题时可以直接在线上换成观测版，查完再换回普通版。
+
+**确认装的是哪个变体：**
+
+```bash
+python -c "import fastokens, fastokens.observe as o; print(fastokens.__file__); print('observe' if o.enabled() else 'default')"
+```
+
+第一行的路径应当在你要用的 Python 环境里，第二行是变体名。
+
 ## 3. 使用
 
 ### 3.1 直接调用
