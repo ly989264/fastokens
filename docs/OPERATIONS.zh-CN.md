@@ -365,7 +365,7 @@ python -m fastokens.observe sample --pid <进程号> --seconds 10 --out prof
 ```
 
 - 也可以启动一个命令并在热身 `--delay` 秒后采样：`python -m fastokens.observe sample --seconds 10 -- python my_bench.py`；或重新分析以前的原始输出：`--from prof.raw.txt`。
-- `--out prof` 写出 `prof.txt`（报告）、`prof.json`、`prof.folded`（折叠栈，可直接给 flamegraph.pl / speedscope 画火焰图）和 `prof.raw.txt`（采样器原始输出）。
+- `--out prof` 写出 `prof.txt`（报告）、`prof.json`、`prof.folded`（折叠栈，可直接给 flamegraph.pl / speedscope 画火焰图）和 `prof.raw.txt`（采样器原始输出）。Linux 上还会多留下一个 `prof.raw.txt.data`：`perf record` 的原始数据，`--from` 只读 `prof.raw.txt`，用不到它，可以删掉。macOS 上没有这个文件。
 - 报告怎么读：
   - "where the CPU goes"：在 CPU 上的样本按栈顶函数分类，如 `stage: BPE`、`regex engine`、`allocator`、`binding: building Python lists / objects`、`binding: input str -> UTF-8`、`Python interpreter`、`GIL wait`；
   - "called from"：分配器、memcpy、正则引擎的时间分别是哪个阶段调用的；
@@ -500,7 +500,7 @@ python -m fastokens.observe top --url http://127.0.0.1:9465
 - 2.5、2.6、3.4 节的 Python 片段：经 transformers（`patch_transformers()` 加 GLM-5.2）；
 - 5.1 节的 `/`、`/json`、`/metrics`、`POST /reset-slow`；
 - 5.2–5.4 节的 `top --once`、`profile`、`dump`，以及 Python 的 `with obs.profile(...)` 和 `obs.report()`；
-- 5.5 节的 `sample --pid`、`sample -- 命令`、`sample --from` 及其写出的四个文件；
+- 5.5 节的 `sample --pid`、`sample -- 命令`、`sample --from` 及其写出的四个文件（macOS；Linux 上多一个 `.raw.txt.data`，见 5.5 节）；
 - 5.6 节的 `layers`：`--via native` 和 `--via transformers`；
 - 第 0 节第 6 步的一行命令。
 

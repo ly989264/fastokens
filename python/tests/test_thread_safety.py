@@ -7,6 +7,7 @@ lock is always dropped before the GIL is re-acquired, otherwise a mutator that
 holds the GIL while waiting for the write lock would deadlock the process.
 """
 
+import inspect
 import random
 import subprocess
 import sys
@@ -123,62 +124,68 @@ def test_large_encode_releases_the_gil(method):
     )
 
 
-def test_encode_and_mutators_do_not_deadlock():
+_RACE_CALLS = {
+    "encode": "tok.encode(text)",
+    "encode_ordinary": "tok.encode_ordinary(text)",
+    "encode_segments": "tok.encode_segments([(text, True), (text, False)])",
+    "encode_batch": "tok.encode_batch([text, text])",
+    "encode_batch_flat": "tok.encode_batch_flat([text, text])",
+}
+
+
+@pytest.mark.parametrize("method", list(_RACE_CALLS))
+def test_encode_and_mutators_do_not_deadlock(method):
     """Encodes that release the GIL race mutators that hold it.
 
     A deadlock here freezes the whole interpreter (the blocked mutator holds
-    the GIL), so the race runs in a subprocess under a timeout.
+    the GIL), so the race runs in a subprocess under a timeout. The subprocess
+    builds its own input: passed in its command line, the text would exceed
+    Linux's limit on a single argument (128 KiB).
     """
-    script = textwrap.dedent(
-        f"""
-        import threading, time
-        from fastokens._native import Tokenizer
+    script = (
+        "import random, threading, time\n"
+        "from fastokens._native import Tokenizer\n\n"
+        + inspect.getsource(_large_text)
+        + textwrap.dedent(
+            f"""
+            tok = Tokenizer.from_model({MODEL!r})
+            text = _large_text(seed=2)[:400_000]
+            stop = threading.Event()
 
-        tok = Tokenizer.from_model({MODEL!r})
-        text = {_large_text(seed=2)[:400_000]!r}
-        stop = threading.Event()
+            def encoder():
+                while not stop.is_set():
+                    {_RACE_CALLS[method]}
 
-        calls = [
-            lambda: tok.encode(text),
-            lambda: tok.encode_ordinary(text),
-            lambda: tok.encode_segments([(text, True), (text, False)]),
-            lambda: tok.encode_batch([text, text]),
-            lambda: tok.encode_batch_flat([text, text]),
-        ]
+            def mutator():
+                i = 0
+                while not stop.is_set():
+                    if i % 4 == 0:
+                        tok.enable_truncation(max_length=10**9)
+                    elif i % 4 == 1:
+                        tok.no_truncation()
+                    elif i % 4 == 2:
+                        tok.enable_padding(pad_id=0)
+                    else:
+                        tok.no_padding()
+                    i += 1
 
-        def encoder(call):
-            while not stop.is_set():
-                call()
-
-        def mutator():
-            i = 0
-            while not stop.is_set():
-                if i % 4 == 0:
-                    tok.enable_truncation(max_length=10**9)
-                elif i % 4 == 1:
-                    tok.no_truncation()
-                elif i % 4 == 2:
-                    tok.enable_padding(pad_id=0)
-                else:
-                    tok.no_padding()
-                i += 1
-
-        threads = [threading.Thread(target=encoder, args=(c,)) for c in calls]
-        threads += [threading.Thread(target=mutator) for _ in range(2)]
-        for t in threads:
-            t.start()
-        time.sleep(2)
-        stop.set()
-        for t in threads:
-            t.join()
-        print("ok")
-        """
+            threads = [threading.Thread(target=encoder) for _ in range(2)]
+            threads += [threading.Thread(target=mutator) for _ in range(2)]
+            for t in threads:
+                t.start()
+            time.sleep(2)
+            stop.set()
+            for t in threads:
+                t.join()
+            print("ok")
+            """
+        )
     )
     try:
         result = subprocess.run(
             [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
         )
     except subprocess.TimeoutExpired:
-        pytest.fail("encode racing enable_truncation/enable_padding deadlocked")
+        pytest.fail(f"{method} racing enable_truncation/enable_padding deadlocked")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
