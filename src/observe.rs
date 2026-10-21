@@ -1112,8 +1112,10 @@ mod tests {
 
         #[test]
         fn stages_and_path_belong_to_the_encode_that_ran_them() {
+            // On a thread of its own, read through that thread's counters:
+            // other tests encode on other threads meanwhile.
             std::thread::spawn(|| {
-                let before = snapshot();
+                let before = current_thread();
                 // Left over by pipeline calls outside an encode: forgotten.
                 set_path(Path::ScanWhole);
                 stage(Stage::Model).end();
@@ -1121,20 +1123,22 @@ mod tests {
                 set_path(Path::FusedSplit);
                 {
                     let _s = stage(Stage::Pretokenize);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 {
                     let _s = stage(Stage::Model);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                encode_done(10, 2, 5_000_000);
-                let after = snapshot();
+                encode_done(10, 2, 50_000_000);
+                let after = current_thread();
                 let d = |k: &[&str]| n(&after, k) - n(&before, k);
-                assert_eq!(d(&["paths", "fused_split", "calls"]), 1);
-                assert_eq!(d(&["paths", "fused_split", "tokens"]), 2);
-                assert!(d(&["paths", "fused_split", "stage_ns", "pretokenize"]) >= 2_000_000);
-                assert!(d(&["paths", "fused_split", "stage_ns", "model"]) >= 1_000_000);
-                assert!(d(&["paths", "fused_split", "stage_ns", "model"]) < 2_000_000);
+                assert_eq!(d(&["paths", "fused_split"]), 1);
+                assert_eq!(d(&["encode_tokens"]), 2);
+                assert!(d(&["stage_ns", "pretokenize"]) >= 20_000_000);
+                // Each stage holds its own time only; the sleeps are far
+                // enough apart that a slow wake-up cannot blur them.
+                let model = d(&["stage_ns", "model"]);
+                assert!((2_000_000..20_000_000).contains(&model), "{model}");
                 // The next encode starts from zero and the General default.
                 begin_encode();
                 encode_done(1, 1, 1);
