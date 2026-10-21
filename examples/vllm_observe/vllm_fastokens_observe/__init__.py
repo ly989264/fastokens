@@ -7,8 +7,10 @@ copies of their renderer pools) serves ``fastokens.observe.serve()`` on the
 first free port from ``<port>`` up: ``/`` (dashboard), ``/json`` and
 ``/metrics``. The port each process got is logged ("fastokens observe:
 pid=... serving http://127.0.0.1:PORT"); ``/json`` also carries the ``pid``.
-Every tokenizer of the process is listed (``tok0``, ``tok1``, ...), each with
-its own caches. ``FASTOKENS_OBSERVE_HOST`` changes the bind address (default
+Every tokenizer of the process is listed, each with its own caches, named
+by how it was made: ``tok0-loaded`` (built from a tokenizer file, e.g. vLLM's
+own tokenizer, or the one it loads only to read the chat template) or
+``tok1-copy-of-tok0`` (a deep copy, e.g. one of vLLM's renderer-pool copies). ``FASTOKENS_OBSERVE_HOST`` changes the bind address (default
 127.0.0.1; the server has no authentication).
 
 Without ``FASTOKENS_OBSERVE_PORT`` the plugin does nothing.
@@ -21,7 +23,7 @@ import threading
 _PORTS_TRIED = 64
 
 _lock = threading.Lock()
-_tokenizers = []          # every native tokenizer created in this process, in order
+_tokenizers = []          # (name, native tokenizer) of every one made in this process, in order
 _server = None
 _port = None
 
@@ -43,7 +45,7 @@ def _serve_all():
     global _server, _port
     import fastokens.observe as obs
 
-    toks = {f"tok{i}": t for i, t in enumerate(_tokenizers)}
+    toks = dict(_tokenizers)
     host = os.environ.get("FASTOKENS_OBSERVE_HOST", "127.0.0.1")
     if _server is not None:
         _server.shutdown()
@@ -63,9 +65,12 @@ def _serve_all():
     _log().warning("fastokens observe: no free port in %d-%d", base, base + _PORTS_TRIED - 1)
 
 
-def _add(shim):
+def _add(shim, source=None):
     with _lock:
-        _tokenizers.append(shim._fast)
+        i = len(_tokenizers)
+        src = next((k for k, (_, t) in enumerate(_tokenizers) if t is source), None) if source is not None else None
+        name = f"tok{i}-copy-of-tok{src}" if src is not None else f"tok{i}-copy" if source is not None else f"tok{i}-loaded"
+        _tokenizers.append((name, shim._fast))
         try:
             _serve_all()
         except Exception as e:  # never break tokenizer creation
@@ -92,7 +97,7 @@ def register():
 
     def __deepcopy__(self, memo):
         new = deepcopy(self, memo)
-        _add(new)
+        _add(new, source=self._fast)
         return new
 
     shim.__init__, shim.__deepcopy__ = __init__, __deepcopy__

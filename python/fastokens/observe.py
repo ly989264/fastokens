@@ -599,12 +599,29 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def _analyze_window(prev, cur: dict, n: int = 32) -> dict | None:
+    """:func:`analyze` for the dashboard, run in the observed process: its
+    ``slowest`` are the window's own slowest encodes (the slowest few of each
+    recent second), not only those kept since the last :func:`reset_slow`."""
+    if not prev:
+        return None
+    out = analyze(prev, cur)
+    if out.get("enabled"):
+        t0, t1 = prev["process"]["uptime_s"], cur["process"]["uptime_s"]
+        recent = [s for s in json.loads(_native.observe_recent_slowest(t0, n)) if s["at_s"] <= t1]
+        seen = {(s["at_s"], s["ns"]) for s in recent}
+        merged = recent + [s for s in out["slowest"] if (s["at_s"], s["ns"]) not in seen]
+        out["slowest"] = sorted(merged, key=lambda s: -s["ns"])[:n]
+    return out
+
+
 def serve(tokenizers=None, port: int = 9464, host: str = "127.0.0.1") -> ThreadingHTTPServer:
     """Serve the dashboard (``/``), :func:`snapshot` (``/json``) and
     :func:`prometheus` (``/metrics``) from a daemon thread of this process;
     ``POST /reset-slow`` calls :func:`reset_slow`, ``POST /analyze`` with a
     previous snapshot as the body returns the current one and their
-    :func:`analyze`. Binds to localhost by
+    :func:`analyze` (with ``{"windows": {label: snapshot}}`` as the body, one
+    analysis per label under ``analyses``). Binds to localhost by
     default (``port=0`` picks a free port, see ``server.server_address``);
     ``server.shutdown()`` stops it."""
     from ._observe_html import DASHBOARD
@@ -645,13 +662,18 @@ def serve(tokenizers=None, port: int = 9464, host: str = "127.0.0.1") -> Threadi
                     reset_slow()
                     self._send(b"{}", "application/json")
                 elif path == "/analyze":
-                    # The dashboard sends its previous snapshot and gets the
-                    # current one with analyze() of the window between, so
-                    # it shows exactly what report() would.
+                    # The dashboard sends earlier snapshots and gets the
+                    # current one with analyze() of the window since each,
+                    # so it shows what report() would. The body is either one
+                    # snapshot (-> "analysis") or {"windows": {label:
+                    # snapshot}} (-> "analyses", by label).
                     n = int(self.headers.get("Content-Length") or 0)
-                    prev = json.loads(self.rfile.read(n) or b"null") if n else None
+                    req = json.loads(self.rfile.read(n) or b"null") if n else None
                     cur = snapshot(natives)
-                    body = {"snapshot": cur, "analysis": analyze(prev, cur) if prev else None}
+                    if isinstance(req, dict) and "windows" in req:
+                        body = {"snapshot": cur, "analyses": {k: _analyze_window(v, cur) for k, v in req["windows"].items()}}
+                    else:
+                        body = {"snapshot": cur, "analysis": _analyze_window(req, cur)}
                     self._send(json.dumps(body).encode(), "application/json")
                 else:
                     self.send_error(404)

@@ -662,19 +662,31 @@ mod imp {
             }
             publish_bpe(s);
         }
-        slow_candidate(ns, || Slow {
-            at_s: epoch().elapsed().as_secs_f64(),
-            ns,
-            bytes: bytes as u64,
-            tokens: tokens as u64,
-            path: path as u8,
-            stages: *stages,
-            slot: slot.unwrap_or(SLOTS - 1),
-        });
+        let at_s = epoch().elapsed().as_secs_f64();
+        let global = ns > SLOW_FLOOR.load(Relaxed);
+        let recent = recent_wants(at_s as u64, ns);
+        if global || recent {
+            let slow = Slow {
+                at_s,
+                ns,
+                bytes: bytes as u64,
+                tokens: tokens as u64,
+                path: path as u8,
+                stages: *stages,
+                slot: slot.unwrap_or(SLOTS - 1),
+            };
+            if recent {
+                recent_push(slow.clone());
+            }
+            if global {
+                slow_push(slow);
+            }
+        }
     }
 
     // ── the slowest encodes ──────────────────────────────────────────────
 
+    #[derive(Clone)]
     struct Slow {
         at_s: f64,
         ns: u64,
@@ -690,14 +702,11 @@ mod imp {
     /// faster encode is turned away without taking the lock.
     static SLOW_FLOOR: AtomicU64 = AtomicU64::new(0);
 
-    fn slow_candidate(ns: u64, make: impl FnOnce() -> Slow) {
-        if ns <= SLOW_FLOOR.load(Relaxed) {
-            return;
-        }
+    fn slow_push(slow: Slow) {
         let Ok(mut kept) = SLOW.lock() else {
             return;
         };
-        kept.push(make());
+        kept.push(slow);
         kept.sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
         kept.truncate(SLOWEST);
         let floor = if kept.len() == SLOWEST {
@@ -716,28 +725,124 @@ mod imp {
         SLOW_FLOOR.store(0, Relaxed);
     }
 
+    fn slow_entry(s: &Slow) -> Value {
+        let stages: serde_json::Map<_, _> = STAGES
+            .iter()
+            .zip(s.stages)
+            .map(|(n, v)| ((*n).to_owned(), v.into()))
+            .collect();
+        json!({
+            "at_s": s.at_s,
+            "ns": s.ns,
+            "bytes": s.bytes,
+            "tokens": s.tokens,
+            "path": PATHS[s.path as usize],
+            "stage_ns": stages,
+            "thread": THREADS[s.slot].name(s.slot),
+        })
+    }
+
     fn slow_json() -> Value {
         let kept = match SLOW.lock() {
             Ok(k) => k,
             Err(e) => e.into_inner(),
         };
-        kept.iter()
-            .map(|s| {
-                let stages: serde_json::Map<_, _> = STAGES
-                    .iter()
-                    .zip(s.stages)
-                    .map(|(n, v)| ((*n).to_owned(), v.into()))
-                    .collect();
-                json!({
-                    "at_s": s.at_s,
-                    "ns": s.ns,
-                    "bytes": s.bytes,
-                    "tokens": s.tokens,
-                    "path": PATHS[s.path as usize],
-                    "stage_ns": stages,
-                    "thread": THREADS[s.slot].name(s.slot),
-                })
-            })
+        kept.iter().map(slow_entry).collect::<Vec<_>>().into()
+    }
+
+    // ── the slowest encodes of each recent second ────────────────────────
+
+    /// Seconds of history behind [`recent_slowest`]: enough for a one-minute
+    /// window.
+    pub const RECENT_SECS: u64 = 64;
+    /// How many of each second's slowest encodes are kept.
+    pub const RECENT_PER_SEC: usize = 8;
+
+    struct Second {
+        sec: u64,
+        kept: Vec<Slow>,
+    }
+
+    static RECENT: Mutex<Vec<Second>> = Mutex::new(Vec::new());
+    /// The second being filled (high bits) and the time an encode in it must
+    /// beat to be kept (low [`FLOOR_BITS`], ns; 0 until it holds
+    /// [`RECENT_PER_SEC`]), in one word so a faster encode is turned away
+    /// without taking the lock.
+    static RECENT_FLOOR: AtomicU64 = AtomicU64::new(u64::MAX);
+    const FLOOR_BITS: u32 = 40;
+    const FLOOR_MASK: u64 = (1 << FLOOR_BITS) - 1;
+    const SEC_MASK: u64 = (1 << (64 - FLOOR_BITS)) - 1;
+
+    fn recent_wants(sec: u64, ns: u64) -> bool {
+        let w = RECENT_FLOOR.load(Relaxed);
+        w >> FLOOR_BITS != sec & SEC_MASK || ns > w & FLOOR_MASK
+    }
+
+    fn recent_push(slow: Slow) {
+        let sec = slow.at_s as u64;
+        let Ok(mut ring) = RECENT.lock() else {
+            return;
+        };
+        if ring.is_empty() {
+            ring.extend((0..RECENT_SECS).map(|_| Second {
+                sec: u64::MAX,
+                kept: Vec::new(),
+            }));
+        }
+        let second = &mut ring[(sec % RECENT_SECS) as usize];
+        if second.sec != sec {
+            second.sec = sec;
+            second.kept.clear();
+        }
+        second.kept.push(slow);
+        second
+            .kept
+            .sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
+        second.kept.truncate(RECENT_PER_SEC);
+        let floor = if second.kept.len() == RECENT_PER_SEC {
+            second.kept[RECENT_PER_SEC - 1].ns.min(FLOOR_MASK)
+        } else {
+            0
+        };
+        RECENT_FLOOR.store(((sec & SEC_MASK) << FLOOR_BITS) | floor, Relaxed);
+    }
+
+    /// [`recent_push`] for a test: an encode of `ns` that ended at `at_s`.
+    #[cfg(test)]
+    pub(crate) fn recent_push_at(at_s: f64, ns: u64) {
+        recent_push(Slow {
+            at_s,
+            ns,
+            bytes: 1,
+            tokens: 1,
+            path: Path::FusedSplit as u8,
+            stages: [0; STAGES.len()],
+            slot: SLOTS - 1,
+        });
+    }
+
+    /// The slowest encodes that ended after `since_s` (the snapshot's
+    /// `uptime_s` clock), slowest first, at most `n`: drawn from the
+    /// [`RECENT_PER_SEC`] slowest of each of the last [`RECENT_SECS`]
+    /// seconds, so a window of up to a minute lists its own slowest encodes
+    /// whatever ran before it.
+    pub fn recent_slowest(since_s: f64, n: usize) -> Value {
+        let now = epoch().elapsed().as_secs_f64() as u64;
+        let ring = match RECENT.lock() {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
+        let mut found: Vec<&Slow> = ring
+            .iter()
+            .filter(|s| s.sec != u64::MAX && s.sec + RECENT_SECS > now)
+            .flat_map(|s| &s.kept)
+            .filter(|s| s.at_s > since_s)
+            .collect();
+        found.sort_unstable_by_key(|s| std::cmp::Reverse(s.ns));
+        found
+            .into_iter()
+            .take(n)
+            .map(slow_entry)
             .collect::<Vec<_>>()
             .into()
     }
@@ -982,6 +1087,9 @@ mod imp {
     pub fn lock_wait(_: Lock, _: u64) {}
     #[inline(always)]
     pub fn reset_slow() {}
+    pub fn recent_slowest(_: f64, _: usize) -> Value {
+        Value::Array(Vec::new())
+    }
     pub fn current_thread() -> Value {
         Value::Null
     }
@@ -1267,6 +1375,30 @@ mod tests {
                     .iter()
                     .all(|k| n(k, &["ns"]) < base)
             );
+        }
+
+        #[test]
+        fn each_recent_second_keeps_its_slowest() {
+            // A second of its own, well ahead of the one other tests write to.
+            let now = snapshot()["uptime_s"].as_f64().unwrap();
+            let sec = (now as u64 + 32) as f64;
+            let count = RECENT_PER_SEC as u64 * 3;
+            for i in 0..count {
+                recent_push_at(sec + 0.5, 1000 + i);
+            }
+            let ns: Vec<u64> = recent_slowest(sec, 1000)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| n(k, &["ns"]))
+                .collect();
+            // That second's slowest few, slowest first.
+            let want: Vec<u64> = (0..RECENT_PER_SEC as u64)
+                .map(|i| 1000 + count - 1 - i)
+                .collect();
+            assert_eq!(ns, want);
+            assert_eq!(recent_slowest(sec, 3).as_array().unwrap().len(), 3);
+            assert!(recent_slowest(sec + 1.0, 10).as_array().unwrap().is_empty());
         }
 
         #[test]

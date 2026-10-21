@@ -236,7 +236,7 @@ export FASTOKENS_INPUT_CACHE=64 FASTOKENS_INPUT_CACHE_MIB=1024
 
 - **条数 ≥ 活跃会话数，建议取 1.5–2 倍**。每个活跃会话需要一条（它最新的那个请求）；条数不够时，一个会话的条目常在它下一次请求之前就被淘汰，这个请求几乎要整段重编。另外"用户改写了大部分历史"之后旧版本不会被替换，会占着槽位直到淘汰，所以要留余量。
 - **字节预算**：约等于 条数 × 单个请求的大小 × 2.2。例如 10 万 token 的会话（约 40 万字符），一条约 0.8 MiB，`FASTOKENS_INPUT_CACHE=512` 约占 400 MiB 左右；请求长到 100 万 token 就是十倍，所以要设 `FASTOKENS_INPUT_CACHE_MIB` 封顶。
-- **在 vLLM 里**：和段缓存一样，每个 API 进程的每份分词器拷贝各一份，变量要进每个 API 进程。拷贝池按先进先出轮流借出拷贝，同一个会话的相邻请求会落到不同的拷贝上，所以**每份拷贝的条数都要按"能见到全部活跃会话"来定**（每个进程只算分给它的会话）。
+- **在 vLLM 里**：和段缓存一样，每个 API 进程的每份分词器拷贝各一份，变量要进每个 API 进程。同一个会话的相邻请求可能落到不同的拷贝上，具体分配不固定；按最坏情况定，**每份拷贝的条数都要按"能见到全部活跃会话"来定**（每个进程只算分给它的会话）。
 
   实际内存上限 ≈ min(条数 × 单条大小, 字节预算) × (`--renderer-num-workers` + 1) × `--api-server-count`
 
@@ -310,7 +310,7 @@ import fastokens.observe as obs
 server = obs.serve({"glm": tok}, port=9464)    # 后台线程；port=0 自动选端口
 ```
 
-- `http://127.0.0.1:9464/`：仪表盘（每秒刷新：吞吐、各阶段耗时、各路径、缓存命中、线程、最慢的请求）；普通版的仪表盘没有数据可显示；
+- `http://127.0.0.1:9464/`：仪表盘（每秒刷新：吞吐、各阶段耗时、各路径、缓存命中、线程、最慢的请求）。右上角选统计窗口 1 / 10 / 60 秒，默认 10 秒，窗口越长数字越稳；普通版的仪表盘没有数据可显示；
 - `/json`：完整快照；
 - `/metrics`：Prometheus 文本格式，可以直接接 Prometheus / Grafana；
 - `POST /reset-slow` 清空"最慢请求"列表，`POST /analyze` 供仪表盘使用。
@@ -413,7 +413,7 @@ python -m fastokens.observe sample --pid 12345 --seconds 10 --out api0
 
 仪表盘、`top`、`profile` 都要求进程里调用了 `observe.serve()`，main 上没有环境变量能让它自动启动；而且 vLLM 的分词器（包括拷贝池里的每份拷贝）是在启动过程中才创建的。仓库里的 [`examples/vllm_observe/`](../examples/vllm_observe/) 是一个 vLLM general plugin，解决这两件事：
 
-- 每个 vLLM 进程一创建 fastokens 分词器，它就在这个进程里启动 `serve()`，列出这个进程的所有分词器（`tok0`、`tok1`……，每份拷贝各自的缓存）；
+- 每个 vLLM 进程一创建 fastokens 分词器，它就在这个进程里启动 `serve()`，列出这个进程的所有分词器，每份各自的缓存。名字说明它是怎么来的：`tok0-loaded` 是加载的分词器，`tok1-copy-of-tok0` 是从 `tok0` 深拷贝出来的一份；
 - 端口从 `FASTOKENS_OBSERVE_PORT` 开始找第一个空闲的，日志里会打印每个进程拿到的端口；`/json` 里也有 `pid`；
 - 不设 `FASTOKENS_OBSERVE_PORT` 时什么都不做。
 
@@ -444,7 +444,7 @@ python -m fastokens.observe top --url http://127.0.0.1:9465
 说明：
 
 - 实测（vLLM 0.23，`--api-server-count 2`）：两个 API 进程拿到 9464、9465，引擎进程（EngineCore）也创建了一个分词器、拿到 9466（它不处理聊天请求，缓存一直是空的）；`vllm serve` 的主进程没有创建。谁拿到哪个端口取决于启动先后，以日志为准。
-- 每个 API 进程里列出 4 个分词器（默认 `--renderer-num-workers 1`）：`tok1`、`tok2` 是拷贝池里干活的两份，各有自己的缓存；`tok0`（原始的那个）和 `tok3` 不处理聊天请求，缓存一直是空的，不占缓存内存。vLLM 走的是 `encode_batch` 接口，大多记在 `segments_cached` 路径（前缀缓存复用后只剩一小段的记在 `fused_split`，完全相同的请求记在 `prefix_exact`）。
+- 每个 API 进程里列出 4 个分词器（默认 `--renderer-num-workers 1`）：`tok1-copy-of-tok0`、`tok2-copy-of-tok0` 是渲染线程池的两份拷贝，处理请求，各有自己的缓存（具体用到哪几份不固定：有的运行里两份交替使用，有的运行里分词全落在其中一份，另一份在仪表盘里显示为空闲）；`tok0-loaded` 是 vLLM 加载的原始分词器（请求都交给拷贝），`tok3-loaded` 是 vLLM 为读取聊天模板另外加载的一份，这两个不处理请求，缓存一直是空的，不占缓存内存，仪表盘把它们收在"空闲的实例"里。vLLM 走的是 `encode_batch` 接口，大多记在 `segments_cached` 路径（前缀缓存复用后只剩一小段的记在 `fused_split`，完全相同的请求记在 `prefix_exact`）。
 - 两个缓存都开时，先看前缀缓存的复用比例（`top` 里 `reused … of input bytes`）：前缀缓存先把历史复用掉，段缓存只处理剩下的部分，所以它的命中率会显得很低，这是正常的。
 - 插件不改变分词结果；它在每个新分词器创建时重启一次本进程的观测服务（只在启动时发生几次）。
 - `FASTOKENS_OBSERVE_HOST` 可以改监听地址（默认 127.0.0.1，没有鉴权）。

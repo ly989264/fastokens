@@ -612,6 +612,15 @@ fn observe_snapshot() -> String {
     fastokens::observe::snapshot().to_string()
 }
 
+/// The slowest encodes that ended after `since_s` (on the `uptime_s` clock of
+/// `observe_snapshot()`), slowest first, at most `n`, as JSON: drawn from the
+/// slowest few of each of the last 64 seconds, so a dashboard window of up to
+/// a minute lists its own slowest encodes. `[]` without the `observe` feature.
+#[pyfunction]
+fn observe_recent_slowest(since_s: f64, n: usize) -> String {
+    fastokens::observe::recent_slowest(since_s, n).to_string()
+}
+
 /// Forget the slowest encodes kept so far (to start a profile window).
 #[pyfunction]
 fn observe_reset_slow() {
@@ -1602,5 +1611,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(observe_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(observe_enabled, m)?)?;
     m.add_function(wrap_pyfunction!(observe_reset_slow, m)?)?;
+    m.add_function(wrap_pyfunction!(observe_recent_slowest, m)?)?;
     Ok(())
 }

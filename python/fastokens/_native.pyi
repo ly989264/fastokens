@@ -249,3 +249,9 @@ def observe_enabled() -> bool:
 def observe_reset_slow() -> None:
     """Forget the slowest encodes kept so far (start a fresh profile window)."""
     ...
+
+def observe_recent_slowest(since_s: float, n: int) -> str:
+    """The slowest encodes that ended after `since_s` (the snapshot's
+    `uptime_s` clock), slowest first, at most `n`, as JSON, from the slowest
+    few of each of the last 64 seconds. `[]` without the `observe` feature."""
+    ...
