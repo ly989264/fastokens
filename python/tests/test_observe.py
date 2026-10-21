@@ -191,6 +191,26 @@ def test_native_of_unwraps_a_patched_transformers_tokenizer():
         fastokens.unpatch_transformers()
 
 
+@pytest.mark.skipif(not ENABLED, reason="needs the observe build")
+def test_the_dashboard_lists_each_windows_own_slowest_encodes():
+    tok = _tiny()
+    obs.reset_slow()
+    # Fill the since-reset list with slow encodes: it then turns away the
+    # quick ones below, which the window must still list.
+    for _ in range(40):
+        tok.encode("end" * 20000)
+    time.sleep(1.05)  # the next encodes run in a second of their own
+    s0 = obs.snapshot()
+    for _ in range(5):
+        tok.encode("end<end>end")
+    s1 = obs.snapshot()
+    assert not obs.analyze(s0, s1)["slowest"]
+    slow = obs._analyze_window(s0, s1)["slowest"]
+    assert len(slow) == 5
+    assert all(s0["process"]["uptime_s"] < s["at_s"] <= s1["process"]["uptime_s"] for s in slow)
+    assert [s["bytes"] for s in slow] == [len("end<end>end")] * 5
+
+
 def test_http_server_serves_dashboard_json_metrics_and_posts():
     tok = _tiny()
     server = obs.serve({"tiny": tok}, port=0)
@@ -217,7 +237,24 @@ def test_http_server_serves_dashboard_json_metrics_and_posts():
         tok.encode("end<end>")
         status, body = _post(base + "/analyze", json.dumps(first["snapshot"]).encode())
         second = json.loads(body)
-        assert second["analysis"] == obs.analyze(first["snapshot"], second["snapshot"])
+        expected = obs.analyze(first["snapshot"], second["snapshot"])
+        got = second["analysis"]
+        # The window's own slowest encodes, beyond those analyze() sees.
+        if ENABLED:
+            t0, t1 = first["snapshot"]["process"]["uptime_s"], second["snapshot"]["process"]["uptime_s"]
+            slow = got.pop("slowest")
+            ns = [s["ns"] for s in slow]
+            assert ns and ns == sorted(ns, reverse=True)
+            assert all(t0 < s["at_s"] <= t1 for s in slow)
+            expected.pop("slowest")
+        assert got == expected
+        # Several windows in one call, by label.
+        status, body = _post(base + "/analyze", json.dumps({"windows": {"1": second["snapshot"], "10": first["snapshot"]}}).encode())
+        both = json.loads(body)
+        assert set(both["analyses"]) == {"1", "10"}
+        if ENABLED:
+            assert both["analyses"]["10"]["window_s"] > both["analyses"]["1"]["window_s"]
+            assert both["analyses"]["10"]["paths"]
         assert _post(base + "/reset-slow")[0] == 200
         with pytest.raises(urllib.error.HTTPError) as e:
             _get(base + "/nope")
