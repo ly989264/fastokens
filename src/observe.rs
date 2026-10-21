@@ -36,15 +36,18 @@ pub enum Path {
     FusedSplit,
     /// Normalize + pre-tokenize + model pipeline.
     General,
+    /// Answered whole by the prefix cache: an exact repeat, nothing encoded.
+    PrefixExact,
 }
 
 #[cfg_attr(not(feature = "observe"), allow(dead_code))]
-const PATHS: [&str; 5] = [
+const PATHS: [&str; 6] = [
     "scan_whole",
     "scan_splits",
     "segments_cached",
     "fused_split",
     "general",
+    "prefix_exact",
 ];
 
 /// A timed stage of one encode. Stages do not overlap; what a request spends
@@ -613,6 +616,7 @@ mod imp {
         Path::SegmentsCached,
         Path::FusedSplit,
         Path::General,
+        Path::PrefixExact,
     ];
 
     /// Count the encode that just finished: `bytes` of input, `tokens` of
