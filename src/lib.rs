@@ -597,7 +597,8 @@ pub struct Tokenizer {
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
     /// Optional cache of text-segment encodings; `None` (off) unless enabled.
-    segment_cache: Option<SegmentCache>,
+    /// Shared with the tokenizer's copies (see [`Self::share_segment_cache_from`]).
+    segment_cache: Option<Arc<SegmentCache>>,
     /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
     /// True for metaspace models (e.g. Gemma) whose pre-tokenizer is a no-op
     /// after normalization; false for ByteLevel models, whose regex `Split`
@@ -1040,12 +1041,14 @@ impl Tokenizer {
         let added_tokens = AddedTokens::from_configs(&configs).map_err(Error::Model)?;
         self.added_tokens = added_tokens;
 
-        // Cached encodings were produced against the previous vocabulary.
+        // Cached encodings were produced against the previous vocabulary. The
+        // segment cache may be shared with copies that keep that vocabulary,
+        // so this tokenizer moves to a fresh one rather than clearing it.
         if let Some(cache) = &self.input_cache {
             cache.lock().unwrap().clear();
         }
-        if let Some(cache) = &self.segment_cache {
-            cache.clear();
+        if let Some(cache) = &mut self.segment_cache {
+            *cache = Arc::new(SegmentCache::new(cache.max_bytes()));
         }
 
         Ok(changed)
@@ -1083,7 +1086,17 @@ impl Tokenizer {
     /// re-sends its whole history on every request, so all but the newest
     /// segments hit. Results are identical to encoding from scratch.
     pub fn enable_segment_cache(&mut self, max_bytes: usize) {
-        self.segment_cache = Some(SegmentCache::new(max_bytes));
+        self.segment_cache = Some(Arc::new(SegmentCache::new(max_bytes)));
+    }
+
+    /// Share `other`'s segment cache, replacing any current one, or run
+    /// without one if `other` has none. For a copy of `other` (one that
+    /// tokenizes identically): a segment either of them encodes is then a hit
+    /// for both, within one budget, where separate caches would each miss it
+    /// and store it. `add_tokens` moves the tokenizer it is called on to a
+    /// fresh cache, so copies with different vocabularies never share one.
+    pub fn share_segment_cache_from(&mut self, other: &Tokenizer) {
+        self.segment_cache = other.segment_cache.clone();
     }
 
     /// Run the full encoding pipeline with control over special token insertion.
@@ -2503,6 +2516,54 @@ mod local_tests {
         }
         // "say hi to <|c|> now" was cached as one segment; it is now three.
         assert_eq!(cached.encode(input).unwrap(), plain.encode(input).unwrap());
+    }
+
+    /// A copy sharing the original's cache uses the very same cache; adding
+    /// tokens moves the copy to a fresh one and leaves the original's alone;
+    /// sharing from a tokenizer without a cache leaves the copy without one.
+    #[test]
+    fn segment_cache_is_shared_with_copies_until_their_vocabularies_differ() {
+        let build = || {
+            segment_test_tokenizer(
+                Value::Null,
+                json!({"type": "ByteLevel",
+                "add_prefix_space": false, "trim_offsets": true, "use_regex": true}),
+            )
+        };
+        let plain = build();
+        let mut original = build();
+        original.enable_segment_cache(1 << 20);
+        let mut copy = build();
+        copy.share_segment_cache_from(&original);
+        let shared = |a: &Tokenizer, b: &Tokenizer| {
+            Arc::ptr_eq(
+                a.segment_cache.as_ref().unwrap(),
+                b.segment_cache.as_ref().unwrap(),
+            )
+        };
+        assert!(shared(&original, &copy));
+
+        let input = "<|a|>the user said hello<|a|>and then<|a|>";
+        assert_eq!(
+            original.encode(input).unwrap(),
+            plain.encode(input).unwrap()
+        );
+        assert_eq!(copy.encode(input).unwrap(), plain.encode(input).unwrap());
+
+        copy.add_tokens(&[NewToken::special("<|d|>")]).unwrap();
+        assert!(!shared(&original, &copy));
+        assert_eq!(copy.segment_cache.as_ref().unwrap().max_bytes(), 1 << 20);
+        assert_eq!(copy.encode(input).unwrap(), plain.encode(input).unwrap());
+        assert_eq!(
+            original.encode(input).unwrap(),
+            plain.encode(input).unwrap()
+        );
+
+        let mut none = build();
+        none.enable_segment_cache(1 << 20);
+        none.share_segment_cache_from(&plain);
+        assert!(none.segment_cache.is_none());
+        assert_eq!(none.encode(input).unwrap(), plain.encode(input).unwrap());
     }
 
     // ── AddedTokenPolicy ────────────────────────────────────────────────

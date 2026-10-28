@@ -1317,6 +1317,19 @@ impl PyTokenizer {
             .map(|config| (config.content, config.id))
             .collect())
     }
+
+    /// Share `other`'s segment cache (`FASTOKENS_SEGMENT_CACHE`), replacing
+    /// any current one, or run without one if `other` has none. For a copy of
+    /// `other`: a segment either tokenizer encodes is then a hit for both,
+    /// within one budget. `add_tokens` moves the tokenizer it is called on to
+    /// a fresh cache.
+    fn share_segment_cache_from(&self, other: PyRef<'_, Self>) {
+        if std::ptr::eq(self, &*other) {
+            return;
+        }
+        let other = other.read();
+        self.write().inner.share_segment_cache_from(&other.inner);
+    }
 }
 
 // ---------------------------------------------------------------------------

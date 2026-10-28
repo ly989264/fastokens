@@ -120,6 +120,9 @@ class _TokenizerShim:
         source = self.to_str() if self._vocab_extended else self._json
         new._vocab_extended = self._vocab_extended
         new._fast = Tokenizer.from_json_str(source, **new._pcre2_options)
+        # One segment cache for a tokenizer and its copies (a serving stack
+        # keeps a pool of copies): what one encodes is a hit for the others.
+        new._fast.share_segment_cache_from(self._fast)
         trunc = self._fast.truncation
         if trunc is not None:
             new._fast.enable_truncation(**trunc)

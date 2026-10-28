@@ -129,11 +129,14 @@ impl Shard {
 }
 
 /// Content-addressed cache of text-segment encodings. See the module docs.
+/// A tokenizer holds it in an `Arc` so that its copies can share it
+/// ([`crate::Tokenizer::share_segment_cache_from`]).
 pub(crate) struct SegmentCache {
     shards: Box<[Mutex<Shard>]>,
     /// Byte budget of each shard's young generation. With the old generation
     /// at most as large, the cache stays within the budget it was built with.
     young_budget: usize,
+    max_bytes: usize,
 }
 
 impl SegmentCache {
@@ -142,7 +145,13 @@ impl SegmentCache {
         Self {
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
             young_budget: (max_bytes / SHARDS / 2).max(1),
+            max_bytes,
         }
+    }
+
+    /// The budget the cache was created with.
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     fn shard(&self, hash: u64) -> &Mutex<Shard> {
@@ -184,13 +193,6 @@ impl SegmentCache {
         shard.insert_young(hash, entry, self.young_budget);
     }
 
-    /// Drop every entry.
-    pub(crate) fn clear(&self) {
-        for shard in self.shards.iter() {
-            *shard.lock().unwrap() = Shard::default();
-        }
-    }
-
     #[cfg(test)]
     fn len(&self) -> usize {
         self.shards
@@ -205,12 +207,12 @@ impl SegmentCache {
 
 /// Build a [`SegmentCache`] from the `FASTOKENS_SEGMENT_CACHE` env var (a size
 /// in MiB), or `None` if it is unset or zero, the default.
-pub(crate) fn from_env() -> Option<SegmentCache> {
+pub(crate) fn from_env() -> Option<Arc<SegmentCache>> {
     std::env::var("FASTOKENS_SEGMENT_CACHE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&mib| mib >= 1)
-        .map(|mib| SegmentCache::new(mib.saturating_mul(1 << 20)))
+        .map(|mib| Arc::new(SegmentCache::new(mib.saturating_mul(1 << 20))))
 }
 
 #[cfg(test)]
@@ -277,14 +279,5 @@ mod tests {
         let h = hash_bytes(&big);
         cache.insert(h, &big, &[1; 100]);
         assert!(cache.get(h, &big).is_none());
-    }
-
-    #[test]
-    fn clear_drops_everything() {
-        let cache = SegmentCache::new(1 << 20);
-        cache.insert(hash_bytes(b"a"), b"a", &[1]);
-        cache.clear();
-        assert!(cache.get(hash_bytes(b"a"), b"a").is_none());
-        assert_eq!(cache.len(), 0);
     }
 }
