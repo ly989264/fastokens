@@ -3930,23 +3930,29 @@ mod sve {
     }
 
     /// Class word `k` of a store buffer: its `pl`-byte predicates back to back
-    /// are the 64-bit class mask. At the 128- and 256-bit vector lengths it is
-    /// read in pieces of the stored size, so each load is fed by one store.
+    /// are the 64-bit class mask. At the 128- and 256-bit vector lengths (`pl`
+    /// 2 and 4) it is read one predicate at a time, so each load is fed by the
+    /// one store that wrote it rather than waiting for two stores to land; the
+    /// loads are volatile because otherwise LLVM merges them into one 8-byte
+    /// load (the pieces add up to the same value). At `pl >= 8` one 8-byte load
+    /// reads part of one store; at `pl == 6` (384 bits) it spans two.
     ///
     /// # Safety
-    /// `buf` holds class `k` as stored by [`classify`] with predicates of `pl` bytes.
+    /// `buf` is 8-byte aligned and holds class `k` as stored by [`classify`] with
+    /// predicates of `pl` bytes.
     #[inline(always)]
     unsafe fn word(buf: *const u8, k: usize, pl: usize) -> u64 {
-        // SAFETY: the caller's contract; class `k` spans at least 8 bytes.
+        // SAFETY: the caller's contract; class `k` spans at least 8 bytes, and
+        // at `pl` 2 and 4 it starts 8-byte aligned, so every piece is aligned.
         unsafe {
             let p = buf.add(k * SLOTS * pl);
             match pl {
                 2 => (0..4).fold(0, |w, i| {
-                    w | (p.add(2 * i).cast::<u16>().read_unaligned() as u64) << (16 * i)
+                    w | (p.add(2 * i).cast::<u16>().read_volatile() as u64) << (16 * i)
                 }),
                 4 => {
-                    p.cast::<u32>().read_unaligned() as u64
-                        | (p.add(4).cast::<u32>().read_unaligned() as u64) << 32
+                    p.cast::<u32>().read_volatile() as u64
+                        | (p.add(4).cast::<u32>().read_volatile() as u64) << 32
                 }
                 _ => p.cast::<u64>().read_unaligned(),
             }
@@ -4087,7 +4093,7 @@ mod sve {
     ///
     /// # Safety
     /// The CPU must have SVE.
-    #[inline]
+    #[inline(always)]
     pub(super) unsafe fn classify_block(bytes: &[u8], off: usize) -> Classes {
         let (src, n) = block(bytes, off);
         let valid = if n == 64 { !0 } else { (1u64 << n) - 1 };
@@ -4128,7 +4134,7 @@ mod sve {
     ///
     /// # Safety
     /// The CPU must have SVE.
-    #[inline]
+    #[inline(always)]
     pub(super) unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(
         bytes: &[u8],
         off: usize,
@@ -4204,7 +4210,7 @@ mod sve {
     ///
     /// # Safety
     /// The CPU must have SVE.
-    #[inline]
+    #[inline(always)]
     pub(super) unsafe fn classify_block_ds<const VIRT: bool>(
         bytes: &[u8],
         off: usize,
