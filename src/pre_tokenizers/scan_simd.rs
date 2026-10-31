@@ -74,13 +74,18 @@ fn in_range(word: u64, lo: u8, hi: u8) -> u64 {
 /// Classify up to 64 bytes starting at `off` into [`Classes`]. Bytes past the end
 /// of `bytes` (when the final block is short) are left unset in every map.
 ///
-/// Dispatches to a NEON kernel on aarch64 (16 bytes/op) and the portable SWAR
-/// kernel elsewhere; both produce identical bitmaps (`classify_matches_scalar`,
-/// and `neon_matches_swar` on aarch64).
+/// Dispatches to the SVE kernel on aarch64 CPUs that have SVE, a NEON kernel on
+/// other aarch64 CPUs (16 bytes/op) and the portable SWAR kernel elsewhere; all
+/// produce identical bitmaps (`classify_matches_scalar`, and `neon_matches_swar`
+/// and `sve_matches_neon_and_portable` on aarch64).
 #[inline]
 pub(crate) fn classify_block(bytes: &[u8], off: usize) -> Classes {
     #[cfg(target_arch = "aarch64")]
     {
+        if sve::available() {
+            // SAFETY: SVE support was just detected.
+            return unsafe { sve::classify_block(bytes, off) };
+        }
         // SAFETY: NEON is baseline on aarch64.
         unsafe { classify_block_neon(bytes, off) }
     }
@@ -482,7 +487,7 @@ fn classify_block_bulk<const CASED: bool, const HAN: bool>(
 }
 
 /// Portable fallback: derive `BulkClasses` from the full SWAR classify.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(test, not(target_arch = "aarch64")))]
 #[inline]
 fn classify_block_bulk_portable<const CASED: bool, const HAN: bool>(
     bytes: &[u8],
@@ -521,7 +526,7 @@ fn classify_block_bulk_portable<const CASED: bool, const HAN: bool>(
 }
 
 /// Portable: bits of the `0x80` bytes (Kimi's Han stand-in) of the block at `off`.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(test, not(target_arch = "aarch64")))]
 fn han_mask(bytes: &[u8], off: usize) -> u64 {
     let end = (off + 64).min(bytes.len());
     bytes[off..end]
@@ -539,6 +544,10 @@ fn unsafe_bulk_classify<const CASED: bool, const HAN: bool>(
 ) -> BulkClasses {
     #[cfg(target_arch = "aarch64")]
     {
+        if sve::available() {
+            // SAFETY: SVE support was just detected.
+            return unsafe { sve::classify_block_bulk::<CASED, HAN>(bytes, off) };
+        }
         // SAFETY: NEON is baseline on aarch64.
         unsafe { classify_block_bulk::<CASED, HAN>(bytes, off) }
     }
@@ -1926,10 +1935,22 @@ struct DsClasses {
     cg: u64,
 }
 
+/// aarch64 DeepSeek classify: the SVE kernel where the CPU has it, else NEON.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn classify_block_ds<const VIRT: bool>(bytes: &[u8], off: usize) -> DsClasses {
+    if sve::available() {
+        // SAFETY: SVE support was just detected.
+        return unsafe { sve::classify_block_ds::<VIRT>(bytes, off) };
+    }
+    // SAFETY: NEON is baseline on aarch64.
+    unsafe { classify_block_ds_neon::<VIRT>(bytes, off) }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn classify_block_ds<const VIRT: bool>(bytes: &[u8], off: usize) -> DsClasses {
+unsafe fn classify_block_ds_neon<const VIRT: bool>(bytes: &[u8], off: usize) -> DsClasses {
     use std::arch::aarch64::*;
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
@@ -2009,7 +2030,7 @@ unsafe fn classify_block_ds<const VIRT: bool>(bytes: &[u8], off: usize) -> DsCla
 }
 
 /// Portable per-byte DeepSeek classify (the reference the SIMD kernels match).
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(test, not(target_arch = "aarch64")))]
 #[inline]
 fn classify_block_ds_scalar<const VIRT: bool>(bytes: &[u8], off: usize) -> DsClasses {
     let mut c = DsClasses::default();
@@ -3833,6 +3854,426 @@ mod avx512 {
     }
 }
 
+// ── aarch64 SVE classify kernels ─────────────────────────────────────────────
+
+/// SVE versions of the classify kernels (aarch64), selected at runtime on CPUs
+/// with SVE (NEON otherwise). Stable Rust has no SVE intrinsics yet
+/// (`stdarch_aarch64_sve` is unstable), so each kernel is one `asm!` loop that
+/// works at any vector length: it takes the 64-byte block one vector (`cntb`
+/// bytes) at a time under a `whilelo` predicate, which also ends at the end of a
+/// short final block, so the tail needs no copy (inactive lanes are not loaded
+/// and compare false). A compare sets one predicate bit per byte lane, so
+/// storing the predicate *is* the movemask that costs NEON a reduction per class.
+/// Outputs are bit-identical to the NEON and portable kernels
+/// (`sve_matches_neon_and_portable`).
+///
+/// The kernels have no `#[target_feature(enable = "sve")]`, which would keep
+/// them from inlining into the scan loops: `.arch_extension sve` lets the
+/// assembler take the instructions, and every caller checks [`available`] first.
+#[cfg(target_arch = "aarch64")]
+mod sve {
+    use core::arch::asm;
+    use core::mem::MaybeUninit;
+
+    use super::{BulkClasses, Classes, DS_CG, DS_CL, DS_CP, DS_VL, DS_VP, DsClasses};
+
+    /// Whether this CPU runs the SVE kernels (cached by `std` after the first call).
+    #[inline(always)]
+    pub(super) fn available() -> bool {
+        std::arch::is_aarch64_feature_detected!("sve")
+    }
+
+    /// Predicate slots per class in a store buffer: a 64-byte block is at most 4
+    /// vectors (at the minimum vector length, 128 bits). The `#4k, mul vl`
+    /// offsets in the kernels below are `k * SLOTS`.
+    const SLOTS: usize = 4;
+    /// `u64`s per class in a store buffer: [`SLOTS`] predicates of up to 32 bytes
+    /// (the maximum vector length, 2048 bits).
+    const CLASS_WORDS: usize = SLOTS * 32 / 8;
+
+    /// Store-buffer class indices. The DeepSeek kernel keeps its controls in
+    /// `AP`'s slot and its bytes `>= 0x80` in `NONASCII`'s.
+    mod slot {
+        pub(super) const ALPHA: usize = 0;
+        pub(super) const DIGIT: usize = 1;
+        pub(super) const WS: usize = 2;
+        pub(super) const NL: usize = 3;
+        pub(super) const SP: usize = 4;
+        pub(super) const AP: usize = 5;
+        pub(super) const NONASCII: usize = 6;
+        pub(super) const UP: usize = 7;
+        pub(super) const SLASH: usize = 8;
+        pub(super) const HAN: usize = 9;
+    }
+
+    // The stand-in compares below use these values as immediates.
+    const _: () =
+        assert!(DS_VL == 0x80 && DS_VP == 0x81 && DS_CL == 0x82 && DS_CP == 0x83 && DS_CG == 0x84);
+
+    /// Bytes per predicate register: `VL / 64`, one bit per byte lane.
+    ///
+    /// # Safety
+    /// The CPU must have SVE.
+    #[inline(always)]
+    pub(super) unsafe fn pred_bytes() -> usize {
+        let vl: usize;
+        // SAFETY: the caller guarantees SVE; `cntb` only reads the vector length.
+        unsafe {
+            asm!(
+                ".arch_extension sve",
+                "cntb {vl}",
+                vl = out(reg) vl,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        vl / 8
+    }
+
+    /// Class word `k` of a store buffer: its `pl`-byte predicates back to back
+    /// are the 64-bit class mask. At the 128- and 256-bit vector lengths it is
+    /// read in pieces of the stored size, so each load is fed by one store.
+    ///
+    /// # Safety
+    /// `buf` holds class `k` as stored by [`classify`] with predicates of `pl` bytes.
+    #[inline(always)]
+    unsafe fn word(buf: *const u8, k: usize, pl: usize) -> u64 {
+        // SAFETY: the caller's contract; class `k` spans at least 8 bytes.
+        unsafe {
+            let p = buf.add(k * SLOTS * pl);
+            match pl {
+                2 => (0..4).fold(0, |w, i| {
+                    w | (p.add(2 * i).cast::<u16>().read_unaligned() as u64) << (16 * i)
+                }),
+                4 => {
+                    p.cast::<u32>().read_unaligned() as u64
+                        | (p.add(4).cast::<u32>().read_unaligned() as u64) << 32
+                }
+                _ => p.cast::<u64>().read_unaligned(),
+            }
+        }
+    }
+
+    /// Run the class tests `$body` over the `$n <= 64` bytes at `$src`. Each pass
+    /// loads one vector into `z0`, with `p0` = its lanes below `$n`; `$body` stores
+    /// class `k`'s predicate at `[{b}, #4k, mul vl]`, and `{b}` moves on one
+    /// predicate per pass, so class `k`'s mask is the bytes from `4k` predicates
+    /// into `$buf` (see [`word`]). The loop always makes the passes of a whole
+    /// block, so short blocks store zeros past `$n`. `$pre` sets the constants
+    /// `$body` needs (in `z27`..=`z31`).
+    macro_rules! classify {
+        ($src:expr, $n:expr, $buf:expr, [$($pre:expr),* $(,)?], [$($body:expr),* $(,)?]) => {
+            asm!(
+                ".arch_extension sve",
+                $($pre,)*
+                "mov {i}, #0",
+                "2:",
+                "whilelo p0.b, {i}, {n}",
+                "ld1b {{z0.b}}, p0/z, [{src}, {i}]",
+                $($body,)*
+                "addpl {b}, {b}, #1",
+                "incb {i}",
+                "cmp {i}, #64",
+                "b.lo 2b",
+                src = in(reg) $src,
+                n = in(reg) $n,
+                b = inout(reg) $buf => _,
+                i = out(reg) _,
+                out("z0") _, out("z1") _,
+                out("z27") _, out("z28") _, out("z29") _, out("z30") _, out("z31") _,
+                out("p0") _, out("p1") _, out("p2") _, out("p3") _,
+                out("p4") _, out("p5") _, out("p6") _, out("p7") _,
+                options(nostack),
+            )
+        };
+    }
+
+    /// The ASCII classes of `z0` under `p0` (needs `z31` = `0x20`): `[A-Za-z]` →
+    /// `p1`, `[0-9]` → `p2`, `\s` → `p3`, space → `p4`, `[\r\n]` → `p5`. No byte
+    /// `>= 0x80` matches: the `| 0x20` case fold keeps them above `z`.
+    macro_rules! ascii_tests {
+        () => {
+            concat!(
+                "orr z1.d, z0.d, z31.d\n",
+                "cmphs p1.b, p0/z, z1.b, #97\n",
+                "cmpls p1.b, p1/z, z1.b, #122\n",
+                "cmphs p2.b, p0/z, z0.b, #48\n",
+                "cmpls p2.b, p2/z, z0.b, #57\n",
+                "cmpeq p4.b, p0/z, z0.b, z31.b\n",
+                "cmphs p3.b, p0/z, z0.b, #9\n",
+                "cmpls p3.b, p3/z, z0.b, #13\n",
+                "orr p3.b, p0/z, p3.b, p4.b\n",
+                "cmpeq p5.b, p0/z, z0.b, #10\n",
+                "cmpeq p6.b, p0/z, z0.b, #13\n",
+                "orr p5.b, p0/z, p5.b, p6.b\n",
+            )
+        };
+    }
+
+    /// `'` → `p6`, bytes `>= 0x80` → `p7` (needs `z30` = `'`).
+    macro_rules! ap_nonascii {
+        () => {
+            concat!(
+                "cmpeq p6.b, p0/z, z0.b, z30.b\n",
+                "cmphi p7.b, p0/z, z0.b, #127\n",
+            )
+        };
+    }
+
+    /// DeepSeek's ASCII controls outside `\s`, and DEL → `p6`; bytes `>= 0x80` →
+    /// `p7` (after [`ascii_tests`]; needs `z30` = `0x7F`).
+    macro_rules! ctrl_hi {
+        () => {
+            concat!(
+                "cmplo p6.b, p0/z, z0.b, #32\n",
+                "bic p6.b, p0/z, p6.b, p3.b\n",
+                "cmpeq p7.b, p0/z, z0.b, z30.b\n",
+                "orr p6.b, p0/z, p6.b, p7.b\n",
+                "cmphi p7.b, p0/z, z0.b, #127\n",
+            )
+        };
+    }
+
+    /// Store `p1`, `p2`, `p3`, `p5`, `p4`, `p6`, `p7` as classes 0..=6 (see [`slot`]).
+    macro_rules! store7 {
+        () => {
+            concat!(
+                "str p1, [{b}]\n",
+                "str p2, [{b}, #4, mul vl]\n",
+                "str p3, [{b}, #8, mul vl]\n",
+                "str p5, [{b}, #12, mul vl]\n",
+                "str p4, [{b}, #16, mul vl]\n",
+                "str p6, [{b}, #20, mul vl]\n",
+                "str p7, [{b}, #24, mul vl]\n",
+            )
+        };
+    }
+
+    /// o200k's `[A-Z]` and `/` as classes 7 and 8 (after [`store7`]; needs
+    /// `z29` = `/`).
+    macro_rules! cased {
+        () => {
+            concat!(
+                "cmphs p1.b, p0/z, z0.b, #65\n",
+                "cmpls p1.b, p1/z, z0.b, #90\n",
+                "cmpeq p2.b, p0/z, z0.b, z29.b\n",
+                "str p1, [{b}, #28, mul vl]\n",
+                "str p2, [{b}, #32, mul vl]\n",
+            )
+        };
+    }
+
+    /// Kimi's Han stand-in `0x80` as class 9 (needs `z28` = `0x80`).
+    macro_rules! han {
+        () => {
+            concat!(
+                "cmpeq p3.b, p0/z, z0.b, z28.b\n",
+                "str p3, [{b}, #36, mul vl]\n",
+            )
+        };
+    }
+
+    /// The block at `off` for a masked pass: its start and its byte count.
+    #[inline(always)]
+    fn block(bytes: &[u8], off: usize) -> (*const u8, usize) {
+        let off = off.min(bytes.len());
+        // SAFETY: `off <= bytes.len()`.
+        (
+            unsafe { bytes.as_ptr().add(off) },
+            (bytes.len() - off).min(64),
+        )
+    }
+
+    /// SVE [`super::classify_block_swar`].
+    ///
+    /// # Safety
+    /// The CPU must have SVE.
+    #[inline]
+    pub(super) unsafe fn classify_block(bytes: &[u8], off: usize) -> Classes {
+        let (src, n) = block(bytes, off);
+        let valid = if n == 64 { !0 } else { (1u64 << n) - 1 };
+        let mut buf = MaybeUninit::<[u64; 7 * CLASS_WORDS]>::uninit();
+        let b = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: SVE (caller); reads `n` bytes at `src`, writes 7 classes to `buf`.
+        unsafe {
+            classify!(
+                src,
+                n,
+                b,
+                ["mov z31.b, #32", "mov z30.b, #39"],
+                [ascii_tests!(), ap_nonascii!(), store7!()]
+            );
+        }
+        // SAFETY: SVE (caller); `buf` holds the classes just stored.
+        let pl = unsafe { pred_bytes() };
+        let w = |k| unsafe { word(b, k, pl) };
+        let (alpha, digit, ws, nonascii) = (
+            w(slot::ALPHA),
+            w(slot::DIGIT),
+            w(slot::WS),
+            w(slot::NONASCII),
+        );
+        Classes {
+            alpha,
+            digit,
+            ws,
+            nl: w(slot::NL),
+            other: valid & !nonascii & !(alpha | digit | ws),
+            nonascii,
+            sp: w(slot::SP),
+            ap: w(slot::AP),
+        }
+    }
+
+    /// SVE [`super::classify_block_bulk_portable`].
+    ///
+    /// # Safety
+    /// The CPU must have SVE.
+    #[inline]
+    pub(super) unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(
+        bytes: &[u8],
+        off: usize,
+    ) -> BulkClasses {
+        let (src, n) = block(bytes, off);
+        let mut buf = MaybeUninit::<[u64; 10 * CLASS_WORDS]>::uninit();
+        let b = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: SVE (caller); reads `n` bytes at `src`, writes up to 10 classes
+        // to `buf`.
+        unsafe {
+            match (CASED, HAN) {
+                (false, false) => classify!(
+                    src,
+                    n,
+                    b,
+                    ["mov z31.b, #32", "mov z30.b, #39"],
+                    [ascii_tests!(), ap_nonascii!(), store7!()]
+                ),
+                (true, false) => classify!(
+                    src,
+                    n,
+                    b,
+                    ["mov z31.b, #32", "mov z30.b, #39", "mov z29.b, #47"],
+                    [ascii_tests!(), ap_nonascii!(), store7!(), cased!()]
+                ),
+                (false, true) => classify!(
+                    src,
+                    n,
+                    b,
+                    ["mov z31.b, #32", "mov z30.b, #39", "mov z28.b, #-128"],
+                    [ascii_tests!(), ap_nonascii!(), store7!(), han!()]
+                ),
+                (true, true) => classify!(
+                    src,
+                    n,
+                    b,
+                    [
+                        "mov z31.b, #32",
+                        "mov z30.b, #39",
+                        "mov z29.b, #47",
+                        "mov z28.b, #-128"
+                    ],
+                    [ascii_tests!(), ap_nonascii!(), store7!(), cased!(), han!()]
+                ),
+            }
+        }
+        // SAFETY: SVE (caller); `buf` holds the classes just stored.
+        let pl = unsafe { pred_bytes() };
+        let w = |k| unsafe { word(b, k, pl) };
+        let nonascii = w(slot::NONASCII);
+        let han = if HAN { w(slot::HAN) } else { 0 };
+        let (up, slash) = if CASED {
+            (w(slot::UP), w(slot::SLASH))
+        } else {
+            (0, 0)
+        };
+        BulkClasses {
+            alpha: w(slot::ALPHA),
+            digit: w(slot::DIGIT),
+            ws: w(slot::WS),
+            nl: w(slot::NL),
+            sp: w(slot::SP),
+            ap: w(slot::AP),
+            up,
+            slash,
+            han,
+            // Only non-ASCII is bad — except Kimi's Han stand-in `0x80` when `HAN`.
+            bad: nonascii & !han != 0,
+        }
+    }
+
+    /// SVE [`super::classify_block_ds_scalar`].
+    ///
+    /// # Safety
+    /// The CPU must have SVE.
+    #[inline]
+    pub(super) unsafe fn classify_block_ds<const VIRT: bool>(
+        bytes: &[u8],
+        off: usize,
+    ) -> DsClasses {
+        let (src, n) = block(bytes, off);
+        let mut buf = MaybeUninit::<[u64; 7 * CLASS_WORDS]>::uninit();
+        let b = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: SVE (caller); reads `n` bytes at `src`, writes 7 classes to `buf`.
+        unsafe {
+            classify!(
+                src,
+                n,
+                b,
+                ["mov z31.b, #32", "mov z30.b, #127"],
+                [ascii_tests!(), ctrl_hi!(), store7!()]
+            );
+        }
+        // SAFETY: SVE (caller); `buf` holds the classes just stored.
+        let pl = unsafe { pred_bytes() };
+        let w = |k| unsafe { word(b, k, pl) };
+        let mut c = DsClasses {
+            alpha: w(slot::ALPHA),
+            digit: w(slot::DIGIT),
+            ws: w(slot::WS),
+            nl: w(slot::NL),
+            sp: w(slot::SP),
+            ctrl: w(slot::AP),
+            hi: w(slot::NONASCII),
+            ..DsClasses::default()
+        };
+        if VIRT && c.hi != 0 {
+            // The five stand-ins `DS_VL..=DS_CG` as classes 0..=4.
+            // SAFETY: as above, 5 classes.
+            unsafe {
+                classify!(
+                    src,
+                    n,
+                    b,
+                    [
+                        "mov z27.b, #-128",
+                        "mov z28.b, #-127",
+                        "mov z29.b, #-126",
+                        "mov z30.b, #-125",
+                        "mov z31.b, #-124",
+                    ],
+                    [
+                        "cmpeq p1.b, p0/z, z0.b, z27.b",
+                        "cmpeq p2.b, p0/z, z0.b, z28.b",
+                        "cmpeq p3.b, p0/z, z0.b, z29.b",
+                        "cmpeq p4.b, p0/z, z0.b, z30.b",
+                        "cmpeq p5.b, p0/z, z0.b, z31.b",
+                        "str p1, [{b}]",
+                        "str p2, [{b}, #4, mul vl]",
+                        "str p3, [{b}, #8, mul vl]",
+                        "str p4, [{b}, #12, mul vl]",
+                        "str p5, [{b}, #16, mul vl]",
+                    ]
+                );
+            }
+            c.vl = w(0);
+            c.vp = w(1);
+            c.cl = w(2);
+            c.cp = w(3);
+            c.cg = w(4);
+        }
+        c
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5057,6 +5498,115 @@ mod tests {
                 let neon = unsafe { classify_block_neon(&buf, off) };
                 let swar = classify_block_swar(&buf, off);
                 assert_eq!(neon, swar, "len {len} off {off}");
+            }
+        }
+    }
+
+    /// Every SVE kernel is bit-identical to its NEON and portable counterparts,
+    /// over all byte values (weighted toward the class boundaries and the stand-in
+    /// bytes), every short-block length and offsets on and off the vector edges.
+    /// It runs at the vector length of the CPU it is on (skipped without SVE); run
+    /// it under `qemu-aarch64 -cpu max,sve<bits>=on` to cover other lengths.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sve_matches_neon_and_portable() {
+        if !sve::available() {
+            return;
+        }
+        eprintln!(
+            "SVE vector length: {} bits",
+            unsafe { sve::pred_bytes() } * 64
+        );
+        macro_rules! same {
+            ($sve:expr, $portable:expr, $neon:expr, $ctx:expr) => {{
+                let s = $sve;
+                assert_eq!(s, $portable, "portable, {}", $ctx);
+                assert_eq!(s, $neon, "neon, {}", $ctx);
+            }};
+        }
+        // NEON leaves `han` unset in a full block that is `bad` (every caller drops
+        // a bad block), so against NEON only the rest of a bad block must match.
+        fn unset_han(mut c: BulkClasses) -> BulkClasses {
+            if c.bad {
+                c.han = 0;
+            }
+            c
+        }
+        macro_rules! same_bulk {
+            ($sve:expr, $portable:expr, $neon:expr, $ctx:expr) => {{
+                let s = $sve;
+                assert_eq!(s, $portable, "portable, {}", $ctx);
+                assert_eq!(unset_han(s), unset_han($neon), "neon, {}", $ctx);
+            }};
+        }
+        let mut state = 0x0fed_cba9_8765_4321u64;
+        for len in 0..=200usize {
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let b = match state & 3 {
+                    0 => (state >> 8) as u8,
+                    1 => [
+                        0x00, 0x08, 0x09, 0x0D, 0x0E, 0x1F, 0x20, 0x7F, 0x80, 0x81, 0x82, 0x83,
+                        0x84, 0x85, 0xFF,
+                    ][(state >> 8) as usize % 15],
+                    _ => b" \t\n\rAZaz@[`{09/:'!_.,;#"[(state >> 8) as usize % 23],
+                };
+                buf.push(b);
+            }
+            for off in [
+                0usize, 1, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 128,
+            ] {
+                if off > buf.len() {
+                    continue;
+                }
+                let ctx = format!("len {len} off {off}");
+                unsafe {
+                    same!(
+                        sve::classify_block(&buf, off),
+                        classify_block_swar(&buf, off),
+                        classify_block_neon(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::classify_block_bulk::<false, false>(&buf, off),
+                        classify_block_bulk_portable::<false, false>(&buf, off),
+                        classify_block_bulk::<false, false>(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::classify_block_bulk::<true, false>(&buf, off),
+                        classify_block_bulk_portable::<true, false>(&buf, off),
+                        classify_block_bulk::<true, false>(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::classify_block_bulk::<true, true>(&buf, off),
+                        classify_block_bulk_portable::<true, true>(&buf, off),
+                        classify_block_bulk::<true, true>(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::classify_block_bulk::<false, true>(&buf, off),
+                        classify_block_bulk_portable::<false, true>(&buf, off),
+                        classify_block_bulk::<false, true>(&buf, off),
+                        ctx
+                    );
+                    same!(
+                        sve::classify_block_ds::<false>(&buf, off),
+                        classify_block_ds_scalar::<false>(&buf, off),
+                        classify_block_ds_neon::<false>(&buf, off),
+                        ctx
+                    );
+                    same!(
+                        sve::classify_block_ds::<true>(&buf, off),
+                        classify_block_ds_scalar::<true>(&buf, off),
+                        classify_block_ds_neon::<true>(&buf, off),
+                        ctx
+                    );
+                }
             }
         }
     }
