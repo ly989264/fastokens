@@ -8,7 +8,9 @@ Scenarios (all on chat-templated prompts from `workload.py`):
             encode_ordinary (no special-token split). Every timed call sees a
             distinct prompt, so no whole-input cache can short-circuit it.
   session   one agent session, request after request (each re-sends the full
-            history): total / p50 / p99 encode time, prefix cache off and on.
+            history): total / p50 / p99 encode time with no cache, the prefix
+            cache (FASTOKENS_INPUT_CACHE) and the segment cache
+            (FASTOKENS_SEGMENT_CACHE).
   server    N sessions interleaved round-robin, as a server sees them.
   gil       worst stall of a 1 ms ticker thread (stand-in for the server's
             event loop) while another thread encodes long prompts.
@@ -55,13 +57,21 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q * len(xs)))]
 
 
-def make(model, cache=0):
-    if cache:
-        os.environ["FASTOKENS_INPUT_CACHE"] = str(cache)
+# Cache variants for the session/server scenarios: (tag, env vars). The prefix
+# cache holds a number of inputs, the segment cache a size in MiB.
+def cache_variants(n_inputs):
+    return [("nocache", {}), ("cache", {"FASTOKENS_INPUT_CACHE": n_inputs}),
+            ("segcache", {"FASTOKENS_SEGMENT_CACHE": 512})]
+
+
+def make(model, env=None):
+    env = env or {}
+    os.environ.update({k: str(v) for k, v in env.items()})
     try:
         return workload.load_fastokens(model)
     finally:
-        os.environ.pop("FASTOKENS_INPUT_CACHE", None)
+        for k in env:
+            os.environ.pop(k, None)
 
 
 class Prompts:
@@ -123,17 +133,16 @@ def bench_single(model, P, args, out):
 
 
 def bench_session(model, P, args, out):
-    for cache in (0, 64):
+    for tag, env in cache_variants(64):
         totals, p50s, p99s, lasts = [], [], [], []
         for seed in range(200, 200 + args.repeat):
-            tok = make(model, cache)
+            tok = make(model, env)
             warm(tok, P.last(99, 2))
             lat = [ms(lambda: tok.encode(p)) for p in P.stream(seed)]
             totals.append(sum(lat))
             p50s.append(pct(lat, .5))
             p99s.append(pct(lat, .99))
             lasts.append(max(lat))
-        tag = "cache" if cache else "nocache"
         out[f"session.total_ms.{tag}"] = statistics.median(totals)
         out[f"session.p50_ms.{tag}"] = statistics.median(p50s)
         out[f"session.p99_ms.{tag}"] = statistics.median(p99s)
@@ -146,14 +155,13 @@ def bench_server(model, P, args, out):
     n_sess = 4 if args.quick else 16
     streams = [P.requests(300 + s) for s in range(n_sess)]
     order = [(s, i) for i in range(max(map(len, streams))) for s in range(n_sess) if i < len(streams[s])]
-    for cache in (0, 2 * n_sess):
-        tok = make(model, cache)
+    for tag, env in cache_variants(2 * n_sess):
+        tok = make(model, env)
         warm(tok, P.last(99, 2))
         lat = []
         for s, i in order:
             p = P.render(streams[s][i])
             lat.append(ms(lambda: tok.encode(p)))
-        tag = "cache" if cache else "nocache"
         out[f"server{n_sess}.total_ms.{tag}"] = sum(lat)
         out[f"server{n_sess}.p99_ms.{tag}"] = pct(lat, .99)
         print(f"    server  {n_sess} sessions {tag:8} {len(order)} requests: total {sum(lat):7.0f} ms   "
