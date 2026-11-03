@@ -206,6 +206,13 @@ size (`1` disables parallelism). Idle workers poll for new work for 50 µs
 before sleeping, which bridges back-to-back calls; `FASTOKENS_SPIN_US=<µs>`
 changes that (`0` sleeps at once).
 
+### Threads and the GIL
+
+`encode`, `encode_ordinary` and `encode_segments` release the GIL for inputs of
+32 KiB or more (`encode_batch` and `encode_batch_flat` always do), so other
+Python threads, such as a serving framework's event loop streaming other
+requests, keep running while a long prompt is tokenized.
+
 ### PCRE2 resource limits
 
 PCRE2 resource limits can be set when constructing a tokenizer to guard against

@@ -1606,7 +1606,6 @@ impl PyTokenizer {
         segments: Vec<(String, bool)>,
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
-        let state = self.read();
         let segs: Vec<fastokens::EncodeSegment<'_>> = segments
             .iter()
             .map(|(text, allow_special)| fastokens::EncodeSegment {
@@ -1614,11 +1613,21 @@ impl PyTokenizer {
                 allow_special: *allow_special,
             })
             .collect();
-        let processed = state
-            .inner
-            .encode_segments_unpadded(&segs)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        drop(state);
+        let bytes: usize = segs.iter().map(|seg| seg.text.len()).sum();
+        // The state guard lives inside `run`, so it is dropped before the GIL
+        // is reacquired, as in `encode_batch`.
+        let run = || {
+            self.read()
+                .inner
+                .encode_segments_unpadded(&segs)
+                .map_err(|e| e.to_string())
+        };
+        let processed = if bytes >= GIL_RELEASE_MIN_BYTES {
+            py.allow_threads(run)
+        } else {
+            run()
+        }
+        .map_err(PyValueError::new_err)?;
         self.single_encoding(py, processed)
     }
 
