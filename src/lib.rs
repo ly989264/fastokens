@@ -1967,6 +1967,7 @@ impl Tokenizer {
             cache.touch(h.entry_id());
             let ids = h.entry.ids.to_vec();
             cache.count(Outcome::Exact, bytes.len(), bytes.len(), ids.len());
+            observe::set_path(observe::Path::PrefixExact);
             return Ok(ids);
         }
 

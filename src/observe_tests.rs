@@ -299,6 +299,8 @@ fn prefix_cache_counts_chat_template_repeats_reuse_and_misses() {
         assert_eq!(n(p, &["entries"]), 1);
         let me = observe::current_thread();
         assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
+        // The exact repeat encoded nothing: counted on its own path.
+        assert_eq!(n(&me, &["paths", "prefix_exact"]), 1, "{me}");
 
         // Too short for the chat path, and without added tokens.
         tok.encode("<|im_start|>hi<|im_end|>").unwrap();

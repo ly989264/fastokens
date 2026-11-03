@@ -444,7 +444,7 @@ python -m fastokens.observe top --url http://127.0.0.1:9465
 说明：
 
 - 实测（vLLM 0.23，`--api-server-count 2`）：两个 API 进程拿到 9464、9465，引擎进程（EngineCore）也创建了一个分词器、拿到 9466（它不处理聊天请求，缓存一直是空的）；`vllm serve` 的主进程没有创建。谁拿到哪个端口取决于启动先后，以日志为准。
-- 每个 API 进程里列出 4 个分词器（默认 `--renderer-num-workers 1`）：`tok1`、`tok2` 是拷贝池里干活的两份，各有自己的缓存；`tok0`（原始的那个）和 `tok3` 不处理聊天请求，缓存一直是空的，不占缓存内存。vLLM 走的是 `encode_batch` 接口和 `segments_cached` 路径。
+- 每个 API 进程里列出 4 个分词器（默认 `--renderer-num-workers 1`）：`tok1`、`tok2` 是拷贝池里干活的两份，各有自己的缓存；`tok0`（原始的那个）和 `tok3` 不处理聊天请求，缓存一直是空的，不占缓存内存。vLLM 走的是 `encode_batch` 接口，大多记在 `segments_cached` 路径（前缀缓存复用后只剩一小段的记在 `fused_split`，完全相同的请求记在 `prefix_exact`）。
 - 两个缓存都开时，先看前缀缓存的复用比例（`top` 里 `reused … of input bytes`）：前缀缓存先把历史复用掉，段缓存只处理剩下的部分，所以它的命中率会显得很低，这是正常的。
 - 插件不改变分词结果；它在每个新分词器创建时重启一次本进程的观测服务（只在启动时发生几次）。
 - `FASTOKENS_OBSERVE_HOST` 可以改监听地址（默认 127.0.0.1，没有鉴权）。
