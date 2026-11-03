@@ -19,3 +19,6 @@ serde_json = "1"
 
 [build-dependencies]
 pyo3-build-config = "0.25"
+
+[features]
+observe = ["fastokens/observe"]

@@ -16,7 +16,7 @@ const SCAN_SPECIALS: [&str; 4] = ["<|im_start|>", "<|im_end|>", "<tool_call>", "
 
 /// A tiktoken-style tokenizer for `pattern`: every byte, some merges so
 /// multi-byte tokens occur, and [`SCAN_SPECIALS`] as special tokens.
-fn scan_test_tokenizer(pattern: &str) -> Tokenizer {
+pub(crate) fn scan_test_tokenizer(pattern: &str) -> Tokenizer {
     let mut ranks: Vec<(Vec<u8>, u32)> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
     // Each merge must split into exactly two earlier tokens.
     for merged in [
@@ -73,7 +73,7 @@ fn segment_test_json(normalizer: Value, pre_tokenizer: Value) -> Value {
     })
 }
 
-fn segment_test_tokenizer(normalizer: Value, pre_tokenizer: Value) -> Tokenizer {
+pub(crate) fn segment_test_tokenizer(normalizer: Value, pre_tokenizer: Value) -> Tokenizer {
     Tokenizer::from_json(segment_test_json(normalizer, pre_tokenizer)).unwrap()
 }
 

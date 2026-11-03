@@ -6,6 +6,7 @@ pub(crate) mod huge;
 pub mod json_structs;
 pub mod models;
 pub mod normalizers;
+pub mod observe;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
@@ -1383,6 +1384,18 @@ impl Tokenizer {
         self.segment_cache.as_ref().map(|c| c.stats())
     }
 
+    /// This tokenizer's side of [`observe`]: which fast paths it can take and
+    /// its segment cache (`null` when off), shard by shard with the `observe`
+    /// feature.
+    pub fn observe_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": observe::ENABLED,
+            "scanner_path": self.scan_kind.is_some(),
+            "prefix_cache": self.input_cache.is_some(),
+            "segment_cache": self.segment_cache.as_deref().map(segment_cache::SegmentCache::observe_json),
+        })
+    }
+
     /// Run the full encoding pipeline with control over special token insertion.
     ///
     /// When `add_special_tokens` is true, the post-processor inserts special
@@ -1534,15 +1547,27 @@ impl Tokenizer {
 
         let mut ids = Vec::new();
         for seg in segments {
+            let timer = observe::Timer::start();
             // An untrusted segment is one split; the segment cache keys it by
             // its normalized text like a split between added tokens, which
             // tokenizes the same way. One too long to ever be cached skips it
             // and keeps the in-place scan and the prefix cache.
             let seg_ids = match &self.segment_cache {
-                Some(cache) if !seg.allow_special && cache.can_cache(seg.text.len()) => self
-                    .tokenize_splits_cached(&self.build_pre_tokenized_ordinary(seg.text), cache)?,
+                Some(cache) if !seg.allow_special && cache.can_cache(seg.text.len()) => {
+                    let ids = self.tokenize_splits_cached(
+                        &self.build_pre_tokenized_ordinary(seg.text),
+                        cache,
+                    )?;
+                    observe::set_path(observe::Path::SegmentsCached);
+                    ids
+                }
                 _ => self.encode_pipeline(seg.text, policy(seg))?,
             };
+            // Each segment counts as an encode; an empty one returns before
+            // the pipeline and is not counted.
+            if !seg.text.is_empty() {
+                observe::encode_done(seg.text.len(), timer.ns());
+            }
             if ids.is_empty() {
                 ids = seg_ids;
             } else {
@@ -1686,7 +1711,12 @@ impl Tokenizer {
         add_special_tokens: bool,
         policy: AddedTokenPolicy,
     ) -> Result<E, Error> {
+        let timer = observe::Timer::start();
         let ids = self.encode_pipeline(input, policy)?;
+        // An empty input returns before the pipeline: not counted.
+        if !input.is_empty() {
+            observe::encode_done(input.len(), timer.ns());
+        }
         self.truncate_and_post_process(ids, add_special_tokens)
     }
 
@@ -1735,11 +1765,17 @@ impl Tokenizer {
             && let Some(segs) = self.identity_segments(input, policy)
         {
             let Some(segs) = segs else {
+                observe::set_path(observe::Path::ScanWhole);
                 return self.encode_scanned(kind, input);
             };
             if let [Segment::Text(_)] = segs.as_slice() {
+                observe::set_path(observe::Path::ScanWhole);
                 return self.encode_scanned(kind, input);
             }
+            observe::set_path(match self.segment_cache {
+                Some(_) => observe::Path::SegmentsCached,
+                None => observe::Path::ScanSplits,
+            });
             let mut ids = Vec::with_capacity(ids_capacity(input.len()));
             for seg in &segs {
                 match *seg {
@@ -1772,7 +1808,10 @@ impl Tokenizer {
         if let Some(cache) = &self.segment_cache
             && pts.splits().len() > 1
         {
-            return self.tokenize_splits_cached(&pts, cache);
+            let ids = self.tokenize_splits_cached(&pts, cache)?;
+            // After the splits: a miss tokenized on this thread notes its own.
+            observe::set_path(observe::Path::SegmentsCached);
+            return Ok(ids);
         }
 
         self.tokenize_pre_tokenized(pts)
@@ -1823,6 +1862,7 @@ impl Tokenizer {
             && pts.splits()[0].token_id.is_none()
             && pts.buffer().len() <= u32::MAX as usize
         {
+            observe::set_path(observe::Path::ScanWhole);
             return self.encode_scanned(kind, pts.buffer());
         }
 
@@ -1832,6 +1872,7 @@ impl Tokenizer {
         if let Some(kind) = self.scan_kind
             && pts.buffer().len() <= u32::MAX as usize
         {
+            observe::set_path(observe::Path::ScanSplits);
             let buffer = pts.buffer();
             let mut ids = Vec::with_capacity(buffer.len() / 3 + 1);
             for sp in pts.splits() {
@@ -1851,6 +1892,7 @@ impl Tokenizer {
         // it skips this and falls through to the general path below, which runs
         // the real three-`Split` sequence.
         if let Some(ref split) = self.split_only {
+            observe::set_path(observe::Path::FusedSplit);
             split.pre_tokenize(&mut pts)?;
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {
@@ -1860,6 +1902,7 @@ impl Tokenizer {
             return Ok(ids);
         }
 
+        observe::set_path(observe::Path::General);
         // 2. Pre-tokenize (refine splits in place).
         if let Some(ref pt) = self.pre_tokenizer {
             pt.pre_tokenize(&mut pts)?;
@@ -1941,7 +1984,9 @@ impl Tokenizer {
         add_special_tokens: bool,
         policy: AddedTokenPolicy,
     ) -> Result<Vec<E>, Error> {
+        let _job = observe::JobGuard::start(observe::JobKind::Batch, inputs.len());
         crate::fanout::map(inputs.len(), |i| {
+            let _task = observe::TaskGuard::start();
             self.encode_unpadded(inputs[i].as_ref(), add_special_tokens, policy)
         })
         .into_iter()
@@ -4515,6 +4560,9 @@ mod ordinary_tests;
 
 #[cfg(test)]
 mod segment_cache_tests;
+
+#[cfg(all(test, feature = "observe"))]
+mod observe_tests;
 
 #[cfg(test)]
 mod test_support;

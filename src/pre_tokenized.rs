@@ -176,7 +176,10 @@ impl PreTokenizedString {
             return self.tokenize_sequential(&tokenize_fn);
         }
 
+        let _job =
+            crate::observe::JobGuard::start(crate::observe::JobKind::Pretokenized, job_count);
         concat_parts(crate::fanout::map(job_count, |job_index| {
+            let _task = crate::observe::TaskGuard::start();
             let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
             let mut ids = Vec::with_capacity(chunk.len() * 3);
             for split in chunk {
@@ -210,7 +213,10 @@ impl PreTokenizedString {
             return Ok(ids);
         }
 
+        let _job =
+            crate::observe::JobGuard::start(crate::observe::JobKind::Pretokenized, job_count);
         concat_parts(crate::fanout::map(job_count, |job_index| {
+            let _task = crate::observe::TaskGuard::start();
             let chunk = &self.splits[job_range(self.splits.len(), job_count, job_index)];
             let mut ids = Vec::with_capacity(chunk.len() * 3);
             tokenize_fn(&self.buffer, chunk, &mut ids)?;
@@ -283,7 +289,9 @@ where
         return per_chunk(buffer);
     }
 
+    let _job = crate::observe::JobGuard::start(crate::observe::JobKind::Scan, segments.len());
     concat_parts(crate::fanout::map(segments.len(), |i| {
+        let _task = crate::observe::TaskGuard::start();
         let (s, e) = segments[i];
         per_chunk(&buffer[s..e])
     }))
@@ -320,7 +328,9 @@ where
     }
 
     {
+        let _job = crate::observe::JobGuard::start(crate::observe::JobKind::Scan, segments.len());
         let parts = crate::fanout::map(segments.len(), |i| {
+            let _task = crate::observe::TaskGuard::start();
             let (s, e) = segments[i];
             per_chunk(&buffer[s..e])
         });

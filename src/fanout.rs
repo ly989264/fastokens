@@ -217,6 +217,7 @@ fn run_tasks(job: &Job) {
 }
 
 fn worker(pool: &'static Pool) {
+    crate::observe::register_worker();
     let me = std::thread::current();
     let spin = spin_duration();
     loop {

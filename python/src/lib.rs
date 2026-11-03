@@ -1044,6 +1044,77 @@ impl From<PyNewToken> for fastokens::NewToken {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Observability (the `observe` feature; every hook is a no-op without it)
+// ---------------------------------------------------------------------------
+
+/// Reports one API call to `fastokens::observe` when dropped.
+struct ApiCall {
+    api: fastokens::observe::Api,
+    units: usize,
+    gil_released: bool,
+    /// Time from the end of the GIL-free Rust work to holding the GIL again.
+    gil_wait_ns: u64,
+    timer: fastokens::observe::Timer,
+}
+
+impl ApiCall {
+    /// Start timing a call of `units` (input bytes, or ids for decoding),
+    /// naming the calling Python thread in the snapshot the first time.
+    fn start(py: Python<'_>, api: fastokens::observe::Api, units: usize) -> Self {
+        if !fastokens::observe::current_thread_named() {
+            let name = py
+                .import("threading")
+                .and_then(|t| t.call_method0("current_thread"))
+                .and_then(|t| t.getattr("name"))
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| "python".to_owned());
+            fastokens::observe::name_current_thread(&format!("py:{name}"));
+        }
+        ApiCall {
+            api,
+            units,
+            gil_released: false,
+            gil_wait_ns: 0,
+            timer: fastokens::observe::Timer::start(),
+        }
+    }
+
+    /// Run `f` with the GIL released, counting the wait to get it back.
+    fn allow_threads<T: Send>(&mut self, py: Python<'_>, f: impl FnOnce() -> T + Send) -> T {
+        self.gil_released = true;
+        let (out, back) = py.allow_threads(|| (f(), fastokens::observe::Timer::start()));
+        self.gil_wait_ns += back.ns();
+        out
+    }
+}
+
+impl Drop for ApiCall {
+    fn drop(&mut self) {
+        fastokens::observe::api_call(
+            self.api,
+            self.units,
+            self.timer.ns(),
+            self.gil_released,
+            self.gil_wait_ns,
+        );
+    }
+}
+
+/// `fastokens.observe`'s process-wide snapshot as JSON: the thread pools, the
+/// threads, the encode paths, the API calls and the state-lock waits.
+/// `{"enabled": false}` unless built with the `observe` feature.
+#[pyfunction]
+fn observe_snapshot() -> String {
+    fastokens::observe::snapshot().to_string()
+}
+
+/// Whether this build was compiled with the `observe` feature.
+#[pyfunction]
+fn observe_enabled() -> bool {
+    fastokens::observe::ENABLED
+}
+
 fn added_token_policy(split_special_tokens: bool) -> fastokens::AddedTokenPolicy {
     if split_special_tokens {
         fastokens::AddedTokenPolicy::SkipSpecial
@@ -1154,10 +1225,34 @@ impl PyTokenizer {
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, TokenizerState> {
+        if fastokens::observe::ENABLED {
+            match self.state.try_read() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let t = fastokens::observe::Timer::start();
+                    let g = self.state.read().expect("PyTokenizer state lock poisoned");
+                    fastokens::observe::lock_wait(fastokens::observe::Lock::Read, t.ns());
+                    return g;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {}
+            }
+        }
         self.state.read().expect("PyTokenizer state lock poisoned")
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, TokenizerState> {
+        if fastokens::observe::ENABLED {
+            match self.state.try_write() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let t = fastokens::observe::Timer::start();
+                    let g = self.state.write().expect("PyTokenizer state lock poisoned");
+                    fastokens::observe::lock_wait(fastokens::observe::Lock::Write, t.ns());
+                    return g;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {}
+            }
+        }
         self.state.write().expect("PyTokenizer state lock poisoned")
     }
 
@@ -1551,6 +1646,7 @@ impl PyTokenizer {
     ) -> PyResult<Py<PyEncoding>> {
         let text = utf8(input)?;
         let policy = added_token_policy(split_special_tokens);
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::Encode, text.len());
         let run = || {
             self.read()
                 .inner
@@ -1558,7 +1654,7 @@ impl PyTokenizer {
                 .map_err(|e| e.to_string())
         };
         let processed = if text.len() >= GIL_RELEASE_MIN_BYTES {
-            py.allow_threads(run)
+            obs.allow_threads(py, run)
         } else {
             run()
         }
@@ -1577,6 +1673,7 @@ impl PyTokenizer {
         py: Python<'_>,
     ) -> PyResult<Py<PyEncoding>> {
         let text = utf8(input)?;
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeOrdinary, text.len());
         let run = || {
             self.read()
                 .inner
@@ -1584,7 +1681,7 @@ impl PyTokenizer {
                 .map_err(|e| e.to_string())
         };
         let processed = if text.len() >= GIL_RELEASE_MIN_BYTES {
-            py.allow_threads(run)
+            obs.allow_threads(py, run)
         } else {
             run()
         }
@@ -1614,6 +1711,7 @@ impl PyTokenizer {
             })
             .collect();
         let bytes: usize = segs.iter().map(|seg| seg.text.len()).sum();
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeSegments, bytes);
         // The state guard lives inside `run`, so it is dropped before the GIL
         // is reacquired, as in `encode_batch`.
         let run = || {
@@ -1623,7 +1721,7 @@ impl PyTokenizer {
                 .map_err(|e| e.to_string())
         };
         let processed = if bytes >= GIL_RELEASE_MIN_BYTES {
-            py.allow_threads(run)
+            obs.allow_threads(py, run)
         } else {
             run()
         }
@@ -1647,12 +1745,14 @@ impl PyTokenizer {
     ) -> PyResult<Vec<Py<PyEncoding>>> {
         let policy = added_token_policy(split_special_tokens);
         let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
+        let bytes: usize = texts.iter().map(|t| t.len()).sum();
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeBatch, bytes);
         self.ensure_id_objects(py)?;
         // Drop the state guard before reacquiring the GIL: mutators can wait
         // for the write lock with the GIL held. Snapshot padding with the batch
         // so a concurrent change cannot affect this call's result.
-        let (batch, padding) = py
-            .allow_threads(|| {
+        let (batch, padding) = obs
+            .allow_threads(py, || {
                 let state = self.read();
                 let batch: Vec<ProcessedEncoding> = state
                     .inner
@@ -1710,8 +1810,10 @@ impl PyTokenizer {
     ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
         let policy = added_token_policy(split_special_tokens);
         let texts = inputs.iter().map(utf8).collect::<PyResult<Vec<_>>>()?;
-        let batch: Vec<Vec<u32>> = py
-            .allow_threads(|| {
+        let bytes: usize = texts.iter().map(|t| t.len()).sum();
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeBatchFlat, bytes);
+        let batch: Vec<Vec<u32>> = obs
+            .allow_threads(py, || {
                 // Keep the guard inside allow_threads, as in encode_batch.
                 self.read()
                     .inner
@@ -1800,7 +1902,9 @@ impl PyTokenizer {
     /// Decode token IDs back into text.
     #[pyo3(signature = (ids, skip_special_tokens = false))]
     fn decode(&self, ids: &Bound<'_, PyAny>, skip_special_tokens: bool) -> PyResult<String> {
+        let py = ids.py();
         let ids = Self::extract_decode_ids(ids)?;
+        let _obs = ApiCall::start(py, fastokens::observe::Api::Decode, ids.len());
         self.read()
             .inner
             .decode(&ids, skip_special_tokens)
@@ -1814,7 +1918,10 @@ impl PyTokenizer {
         sentences: &Bound<'_, PyAny>,
         skip_special_tokens: bool,
     ) -> PyResult<Vec<String>> {
+        let py = sentences.py();
         let sentences = Self::extract_decode_batch_ids(sentences)?;
+        let units = sentences.iter().map(Vec::len).sum();
+        let _obs = ApiCall::start(py, fastokens::observe::Api::DecodeBatch, units);
         let state = self.read();
         let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
         state
@@ -1824,6 +1931,13 @@ impl PyTokenizer {
     }
 
     // ── Vocabulary ────────────────────────────────────────────────────
+
+    /// This tokenizer's side of `observe_snapshot()` as JSON: its fast paths
+    /// and its segment cache (`null` when off), shard by shard with the
+    /// `observe` feature.
+    fn observe(&self) -> String {
+        self.read().inner.observe_json().to_string()
+    }
 
     /// Look up the token ID for a string.
     fn token_to_id(&self, token: &str) -> Option<u32> {
@@ -2060,5 +2174,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostProcessor>()?;
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyDecodeStream>()?;
+    m.add_function(wrap_pyfunction!(observe_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(observe_enabled, m)?)?;
     Ok(())
 }

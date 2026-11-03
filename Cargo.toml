@@ -24,6 +24,8 @@ default = ["hf-hub"]
 hf-hub = ["dep:hf-hub", "dep:ureq"]
 # Internal: per-span encode diagnostics counters (benchmark harness only).
 diag = []
+# Runtime counters for observing a running tokenizer (`observe` module).
+observe = []
 
 [dependencies]
 daachorse = "1.0.0"
