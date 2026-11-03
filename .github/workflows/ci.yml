@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # perf/segment-cache-rwlock-ci: test branch only, never merged into main.
+    branches: [main, perf/segment-cache-rwlock-ci]
   pull_request:
     branches: [main]
 
