@@ -587,7 +587,9 @@ impl SegmentCache {
 
     /// The cache's size and, with the `observe` feature, its counters and
     /// every shard's generations (see [`ShardObs`]), with the hit and miss
-    /// size histograms summed over shards.
+    /// size histograms summed over shards. The counters are read as
+    /// [`Self::stats`] reads them: while threads encode, a few lookups in
+    /// flight apart; once lookups stop, exact.
     pub(crate) fn observe_json(&self) -> serde_json::Value {
         let (mut entries, mut bytes) = (0usize, 0usize);
         #[cfg(feature = "observe")]
@@ -660,6 +662,12 @@ impl SegmentCache {
         v
     }
 
+    /// The cache's counters and size, read one shard at a time. Lookups go on
+    /// while it reads, and a lookup adds to its count and to its bytes
+    /// separately, so a snapshot taken while threads encode can be a few
+    /// lookups in flight apart, between the counts and the byte totals as
+    /// between shards. Once lookups stop, `hits + misses` is exactly the
+    /// number of lookups made.
     pub(crate) fn stats(&self) -> SegmentCacheStats {
         let mut stats = SegmentCacheStats {
             max_bytes: self.max_bytes,
