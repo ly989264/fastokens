@@ -367,3 +367,24 @@ fn prefix_cache_counts_cut_backoffs_and_evictions() {
         assert_eq!(n(c, &["entries"]), 2);
     });
 }
+
+#[test]
+fn copies_sharing_a_segment_cache_report_its_id() {
+    let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+    tok.enable_segment_cache(1 << 20);
+    let mut copy = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+    copy.share_segment_cache_from(&tok);
+    let other = {
+        let mut t = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        t.enable_segment_cache(1 << 20);
+        t
+    };
+    let id = |t: &crate::Tokenizer| t.observe_json()["segment_cache"]["id"].clone();
+    assert!(id(&tok).is_u64());
+    assert_eq!(id(&tok), id(&copy));
+    assert_ne!(id(&tok), id(&other));
+    // `add_tokens` moves the copy to a fresh cache of its own.
+    copy.add_tokens(&[crate::NewToken::special("<|extra|>")])
+        .unwrap();
+    assert_ne!(id(&tok), id(&copy));
+}

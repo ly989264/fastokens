@@ -7,11 +7,13 @@ copies of their renderer pools) serves ``fastokens.observe.serve()`` on the
 first free port from ``<port>`` up: ``/`` (dashboard), ``/json`` and
 ``/metrics``. The port each process got is logged ("fastokens observe:
 pid=... serving http://127.0.0.1:PORT"); ``/json`` also carries the ``pid``.
-Every tokenizer of the process is listed, each with its own caches, named
-by how it was made: ``tok0-loaded`` (built from a tokenizer file, e.g. vLLM's
-own tokenizer, or the one it loads only to read the chat template) or
-``tok1-copy-of-tok0`` (a deep copy, e.g. one of vLLM's renderer-pool copies). ``FASTOKENS_OBSERVE_HOST`` changes the bind address (default
-127.0.0.1; the server has no authentication).
+Every tokenizer of the process is listed, named by how it was made:
+``tok0-loaded`` (built from a tokenizer file, e.g. vLLM's own tokenizer, or
+the one it loads only to read the chat template) or ``tok1-copy-of-tok0`` (a
+deep copy, e.g. one of vLLM's renderer-pool copies). Each has its own prefix
+cache; a copy shares its original's segment cache, which is shown once,
+under the first of them listed. ``FASTOKENS_OBSERVE_HOST`` changes the bind
+address (default 127.0.0.1; the server has no authentication).
 
 Without ``FASTOKENS_OBSERVE_PORT`` the plugin does nothing.
 """

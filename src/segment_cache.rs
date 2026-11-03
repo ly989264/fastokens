@@ -533,6 +533,9 @@ impl SegmentCache {
         }
         #[allow(unused_mut)]
         let mut v = serde_json::json!({
+            // Tokenizers sharing this cache (a copy and its original) report
+            // the same id; one given a fresh cache by `add_tokens` a new one.
+            "id": self as *const Self as usize,
             "approx_max_bytes": self.young_budget * SHARDS * 2,
             "young_budget_per_shard": self.young_budget,
             "max_segment_cost": self.young_budget / 2,

@@ -275,14 +275,21 @@ def analyze(prev: dict, cur: dict) -> dict:
     threads.sort(key=lambda t: (t["kind"] != "worker", -t["busy"]))
     out["threads"] = threads
 
-    # Per-tokenizer caches.
+    # Per-tokenizer caches. Copies of a tokenizer share its segment cache:
+    # it is shown under the first of them, the others name that one.
     toks = {}
+    seg_owner = {}
     for name, tj in cur["tokenizers"].items():
         t0 = prev["tokenizers"].get(name) or {}
         entry = {"scanner_path": tj.get("scanner_path")}
         c1 = tj.get("segment_cache")
-        if c1:
+        if c1 and c1.get("id") in seg_owner:
+            entry["segment_cache"] = {"shared_with": seg_owner[c1["id"]]}
+        elif c1:
+            seg_owner[c1.get("id")] = name
             c0 = t0.get("segment_cache") or {}
+            if c0.get("id") != c1.get("id"):  # a fresh cache (add_tokens) counts from zero
+                c0 = {}
             dc = _d(c0, c1)
             seg = {"bytes": c1["bytes"], "approx_max_bytes": c1["approx_max_bytes"], "entries": c1["entries"],
                    "max_segment_cost": c1["max_segment_cost"]}
@@ -383,7 +390,10 @@ def report(prev: dict, cur: dict, slowest: int = 5) -> str:
                  f"write {lw['write']['per_s']:.1f}/s ({lw['write']['ms_per_s']:.2f} ms/s)")
     for name, t in a["tokenizers"].items():
         s = t.get("segment_cache")
-        if s:
+        if s and "shared_with" in s:
+            L.append("")
+            L.append(f"segment cache [{name}]: shared with [{s['shared_with']}]")
+        elif s:
             L.append("")
             line = f"segment cache [{name}]: {s['bytes'] / 2**20:.1f} / ~{s['approx_max_bytes'] / 2**20:.0f} MiB, {s['entries']} entries"
             if "hits" in s:
@@ -550,10 +560,13 @@ def prometheus(snap: dict) -> str:
             m("fastokens_thread_task_seconds_total", t["task_ns"] / 1e9, lab, help_="parallel-task time on a thread")
             m("fastokens_thread_api_seconds_total", t["api_ns"] / 1e9, lab, help_="Python API time on a thread")
             m("fastokens_thread_alive", int(t["alive"]), lab, "gauge", "whether the thread is running")
+    seg_seen = set()
     for name, tj in snap["tokenizers"].items():
         lab = {"tokenizer": name}
         c = tj.get("segment_cache")
-        if c:
+        # A cache shared by copies is exported once, under the first of them.
+        if c and c.get("id") not in seg_seen:
+            seg_seen.add(c.get("id"))
             for key in ("entries", "bytes", "approx_max_bytes"):
                 m(f"fastokens_segment_cache_{key}", c.get(key), lab, "gauge", f"segment cache {key}")
             for key in ("hits", "misses", "hit_bytes", "miss_bytes", "rejected_too_large", "rejected_bytes"):

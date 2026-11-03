@@ -82,7 +82,7 @@ button { font:inherit; font-size:12px; padding:2px 10px; border:1px solid var(--
     <div class="note">忙碌 = 窗口内在 fastokens 里干活的时间占比（调用线程按编码计，线程池线程按任务计）；API 内 = 调用线程在 fastokens Python API 里的时间占比。</div></div>
 </div>
 <div class="card" style="margin-top:12px"><h2>缓存（每个分词器实例一份）</h2><div class="note" style="margin-top:0">
-  每个分词器实例各有自己的 segment cache 和前缀缓存，名字由创建它的程序给出。在 vLLM（examples/vllm_observe 插件）里：
+  每个分词器实例有自己的前缀缓存；深拷贝出来的副本和原分词器共用一个 segment cache，只在最先列出的那个实例下显示，其余写"共用"。名字由创建它的程序给出。在 vLLM（examples/vllm_observe 插件）里：
   tokN-loaded 是加载的分词器，tokN-copy-of-tokM 是从 tokM 深拷贝出来的一份。每个 API 进程有加载的原始分词器（请求都交给拷贝处理，所以它空闲）、
   渲染线程池的拷贝（--renderer-num-workers + 1 份，处理请求；具体用到哪几份不固定，没用到的会收进空闲）、以及为读取聊天模板另外加载的一份（空闲）。所选窗口内没有任何缓存查找的实例收在最下面。</div></div>
 <div id="caches"></div>
@@ -138,8 +138,10 @@ function drawWin() {
 }
 const role = n => /-copy-of-/.test(n) ? "拷贝" : /-loaded$/.test(n) ? "加载的分词器" : "";
 function idle(T) {  // no cache lookups of any kind in the window (only known in an observe build)
-  const S = T.segment_cache, R = T.prefix_cache, C = R && R.chat;
-  if (!S && !R) return false;
+  // A segment cache shared with another instance is counted there.
+  const shared = T.segment_cache && T.segment_cache.shared_with;
+  const S = shared ? null : T.segment_cache, R = T.prefix_cache, C = R && R.chat;
+  if (!S && !R) return !!shared;
   if ((S && S.hits == null) || (R && R.lookups == null)) return false;
   return (!S || S.hits + S.misses === 0) && (!R || R.lookups === 0) && (!C || C.lookups + C.bypass_short + C.bypass_plain === 0);
 }
@@ -220,6 +222,7 @@ function render(A, snap) {
     if (card.parentNode !== home) home.appendChild(card);
     const S = T.segment_cache, seg = card.querySelector(".seg");
     if (!S) kpis(seg, [["状态", "未开启（FASTOKENS_SEGMENT_CACHE）"], ["扫描器快路径", T.scanner_path ? "是" : "否"]]);
+    else if (S.shared_with) kpis(seg, [["状态", `与 ${S.shared_with} 共用，数字见那一栏`], ["扫描器快路径", T.scanner_path ? "是" : "否"]]);
     else {
       const it = [["占用", `${mib(S.bytes)} / ~${mib(S.approx_max_bytes)}`], ["条目", S.entries.toLocaleString()], ["单段上限", fmt(S.max_segment_cost / 1024, 1) + " KB 成本"]];
       if (S.hits != null) {

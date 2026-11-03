@@ -346,6 +346,34 @@ def test_dashboard_script_is_valid_javascript(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+
+def test_a_shared_segment_cache_is_shown_once():
+    def cached():
+        return _with_env("FASTOKENS_SEGMENT_CACHE", 4, _tiny)
+
+    orig, copy, other = cached(), cached(), cached()
+    copy._share_segment_cache_from(orig)
+    toks = {"orig": orig, "copy": copy, "other": other}
+    a = obs.snapshot(toks)
+    for t in toks.values():
+        t.encode("<end>end<end>")
+    b = obs.snapshot(toks)
+    ids = {n: t["segment_cache"]["id"] for n, t in b["tokenizers"].items()}
+    assert ids["orig"] == ids["copy"] != ids["other"]
+    metrics = obs.prometheus(b)
+    assert 'fastokens_segment_cache_bytes{tokenizer="copy"' not in metrics
+    if not ENABLED:  # the window figures below need the counters
+        return
+    caches = obs.analyze(a, b)["tokenizers"]
+    assert caches["copy"]["segment_cache"] == {"shared_with": "orig"}
+    # One text segment per encode: the original's miss, then the copy's hit.
+    seg = caches["orig"]["segment_cache"]
+    assert (seg["hits"], seg["misses"]) == (1, 1)
+    assert "shared_with" not in caches["other"]["segment_cache"]
+    assert "segment cache [copy]: shared with [orig]" in obs.report(a, b)
+    assert 'fastokens_segment_cache_bytes{tokenizer="orig"' in metrics
+    assert 'fastokens_segment_cache_bytes{tokenizer="other"' in metrics
+
 # ── observe builds ───────────────────────────────────────────────────────────
 
 
