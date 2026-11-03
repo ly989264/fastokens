@@ -27,7 +27,12 @@
 //! probe chain.
 //!
 //! The cache is sharded (concurrent sessions hit it from the thread pool, so
-//! one lock would serialize them), with a byte budget per shard, and evicts
+//! one lock would serialize them), each shard behind a read-write lock: a hit
+//! on a young entry and a miss change nothing, so concurrent lookups share the
+//! lock, and only moving an old entry back and inserting take it exclusively.
+//! Each shard and its lock fill their own cache lines, so lookups in different
+//! shards do not write a line another shard's lock or counters are on. There
+//! is a byte budget per shard, and the cache evicts
 //! with two generations rather than an LRU, which would need a linked list
 //! over thousands of entries: entries are inserted into a young map; when the
 //! next insert would overfill it, the old map is dropped and the young one
@@ -38,12 +43,13 @@
 //! more than about 8 KB of text), so the budget should be sized for the
 //! longest segments, tool outputs typically, not just for the total.
 
-#[cfg(feature = "observe")]
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::{
     collections::HashMap,
     hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
 };
 
 /// Number of independently locked shards.
@@ -146,27 +152,31 @@ fn cost_of(text_len: usize, n_ids: usize) -> usize {
 
 /// One lock's worth of the cache: two generations of entries, and the hit and
 /// miss counts of the lookups that came to it, so threads working on
-/// different shards do not contend on one counter.
+/// different shards do not contend on one counter. The counts are atomic
+/// because most lookups hold the lock only for reading. Aligned so that a
+/// shard and its lock start on their own cache line.
 #[derive(Default)]
+#[repr(align(64))]
 struct Shard {
     young: HashMapU64<Entry>,
     old: HashMapU64<Entry>,
     young_bytes: usize,
     old_bytes: usize,
-    hits: u64,
-    misses: u64,
-    hit_bytes: u64,
-    miss_bytes: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    hit_bytes: AtomicU64,
+    miss_bytes: AtomicU64,
     #[cfg(feature = "observe")]
     obs: ShardObs,
 }
 
-/// A shard's [`crate::observe`] counters, updated under its lock.
+/// A shard's [`crate::observe`] counters: atomic where a lookup under the
+/// read lock updates them, plain where only the write lock does.
 #[cfg(feature = "observe")]
 #[derive(Default)]
 struct ShardObs {
     /// Lookups whose hash matched an entry of different text.
-    collisions: u64,
+    collisions: AtomicU64,
     /// Old-generation hits moved back into the young generation.
     promotions: u64,
     inserts: u64,
@@ -176,14 +186,25 @@ struct ShardObs {
     rotations: u64,
     evicted_entries: u64,
     evicted_bytes: u64,
-    /// Lock acquisitions that had to wait, and how long they waited.
-    contended: u64,
-    wait_ns: u64,
+    /// Lock acquisitions (read or write) that had to wait, and how long they
+    /// waited.
+    contended: AtomicU64,
+    wait_ns: AtomicU64,
     /// Segment sizes of every [`SIZE_SAMPLE`]th lookup of a thread: counting
     /// every lookup inside the lock lengthens the critical section enough to
     /// show when many threads share the cache.
-    hit_sizes: [u64; crate::observe::BUCKETS],
-    miss_sizes: [u64; crate::observe::BUCKETS],
+    hit_sizes: [AtomicU64; crate::observe::BUCKETS],
+    miss_sizes: [AtomicU64; crate::observe::BUCKETS],
+}
+
+#[cfg(feature = "observe")]
+impl ShardObs {
+    /// Count a lock acquisition that had to wait since `start`.
+    fn waited(&self, start: std::time::Instant) {
+        self.contended.fetch_add(1, Relaxed);
+        self.wait_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+    }
 }
 
 /// One lookup in this many per thread lands in the size histograms.
@@ -249,6 +270,45 @@ impl Shard {
         Some(entry)
     }
 
+    /// Count a lookup of `len` bytes of text as a hit or a miss.
+    fn count(&self, hit: bool, len: usize) {
+        let (count, bytes) = match hit {
+            true => (&self.hits, &self.hit_bytes),
+            false => (&self.misses, &self.miss_bytes),
+        };
+        count.fetch_add(1, Relaxed);
+        bytes.fetch_add(len as u64, Relaxed);
+    }
+
+    /// The lookup of `text`, whose key is `hash`, as far as it can go without
+    /// changing anything, counted: `Some` with the cached ids or `None` (a
+    /// miss) once it is settled, or `None` without counting when `text` is an
+    /// old entry, which only [`Self::get`] can move back.
+    fn peek(&self, hash: u64, text: &[u8]) -> Option<Option<Arc<[u32]>>> {
+        let ids = match self.young.get(&hash) {
+            Some(entry) => {
+                let ids = (*entry.text == *text).then(|| entry.ids.clone());
+                #[cfg(feature = "observe")]
+                if ids.is_none() {
+                    self.obs.collisions.fetch_add(1, Relaxed);
+                }
+                ids
+            }
+            None => match self.old.get(&hash) {
+                Some(entry) if *entry.text == *text => return None,
+                _other => {
+                    #[cfg(feature = "observe")]
+                    if _other.is_some() {
+                        self.obs.collisions.fetch_add(1, Relaxed);
+                    }
+                    None
+                }
+            },
+        };
+        self.count(ids.is_some(), text.len());
+        Some(ids)
+    }
+
     /// The cached ids of `text`, whose key is `hash`, counted as a hit or a
     /// miss. A hit on an old entry moves it back into the young generation,
     /// which may drop the old one: that is returned for the caller to free
@@ -265,7 +325,7 @@ impl Shard {
                 let ids = (*entry.text == *text).then(|| entry.ids.clone());
                 #[cfg(feature = "observe")]
                 if ids.is_none() {
-                    self.obs.collisions += 1;
+                    self.obs.collisions.fetch_add(1, Relaxed);
                 }
                 ids
             }
@@ -286,18 +346,24 @@ impl Shard {
             None => {
                 #[cfg(feature = "observe")]
                 if self.old.contains_key(&hash) {
-                    self.obs.collisions += 1;
+                    self.obs.collisions.fetch_add(1, Relaxed);
                 }
                 None
             }
         };
-        let (count, bytes) = match ids {
-            Some(_) => (&mut self.hits, &mut self.hit_bytes),
-            None => (&mut self.misses, &mut self.miss_bytes),
-        };
-        *count += 1;
-        *bytes += text.len() as u64;
+        self.count(ids.is_some(), text.len());
         (ids, dropped)
+    }
+
+    /// Put a lookup of `len` bytes in the size histograms ([`SIZE_SAMPLE`]).
+    #[cfg(feature = "observe")]
+    fn sample(&self, hit: bool, len: usize) {
+        let b = crate::observe::bucket(len as u64);
+        let sizes = match hit {
+            true => &self.obs.hit_sizes,
+            false => &self.obs.miss_sizes,
+        };
+        sizes[b].fetch_add(1, Relaxed);
     }
 }
 
@@ -331,7 +397,7 @@ pub struct SegmentCacheStats {
 /// A tokenizer holds it in an `Arc` so that its copies can share it
 /// ([`crate::Tokenizer::share_segment_cache_from`]).
 pub(crate) struct SegmentCache {
-    shards: Box<[Mutex<Shard>]>,
+    shards: Box<[RwLock<Shard>]>,
     /// Byte budget of each shard's young generation; the old generation is at
     /// most as large, so the shards together stay within `max_bytes`.
     young_budget: usize,
@@ -346,7 +412,7 @@ impl SegmentCache {
     /// A cache holding at most `max_bytes` of segment text and ids.
     pub(crate) fn new(max_bytes: usize) -> Self {
         Self {
-            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             young_budget: (max_bytes / SHARDS / 2).max(1),
             max_bytes,
             keys: RandomState::new(),
@@ -402,28 +468,46 @@ impl SegmentCache {
         self.keys.hash_one(hash_bytes(text))
     }
 
-    fn shard(&self, hash: u64) -> &Mutex<Shard> {
+    fn shard(&self, hash: u64) -> &RwLock<Shard> {
         // Bits the maps' bucket index (low) and tag (top) do not use.
         &self.shards[(hash >> 32) as usize % SHARDS]
     }
 
-    /// Lock the shard of `hash`, counting a wait if another thread held it.
-    fn lock_shard(&self, hash: u64) -> std::sync::MutexGuard<'_, Shard> {
-        let m = self.shard(hash);
+    /// Read-lock the shard of `hash`, counting a wait if a writer held it.
+    fn read_shard(&self, hash: u64) -> RwLockReadGuard<'_, Shard> {
+        let lock = self.shard(hash);
         #[cfg(feature = "observe")]
-        match m.try_lock() {
+        match lock.try_read() {
             Ok(shard) => return shard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 let t = std::time::Instant::now();
-                let mut shard = m.lock().unwrap();
-                shard.obs.contended += 1;
-                shard.obs.wait_ns += t.elapsed().as_nanos() as u64;
+                let shard = lock.read().unwrap();
+                shard.obs.waited(t);
                 return shard;
             }
             // Poisoned: the plain lock below panics as it always did.
             Err(std::sync::TryLockError::Poisoned(_)) => {}
         }
-        m.lock().unwrap()
+        lock.read().unwrap()
+    }
+
+    /// Write-lock the shard of `hash`, counting a wait if another thread held
+    /// it.
+    fn write_shard(&self, hash: u64) -> RwLockWriteGuard<'_, Shard> {
+        let lock = self.shard(hash);
+        #[cfg(feature = "observe")]
+        match lock.try_write() {
+            Ok(shard) => return shard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let t = std::time::Instant::now();
+                let shard = lock.write().unwrap();
+                shard.obs.waited(t);
+                return shard;
+            }
+            // Poisoned: the plain lock below panics as it always did.
+            Err(std::sync::TryLockError::Poisoned(_)) => {}
+        }
+        lock.write().unwrap()
     }
 
     /// The cached ids of `text`, whose [`Self::key`] is `hash`, counted as a
@@ -437,15 +521,25 @@ impl SegmentCache {
                 k % SIZE_SAMPLE == 0
             })
             .unwrap_or(false);
-        let mut shard = self.lock_shard(hash);
+        // A young hit and a miss are settled under the read lock; only an old
+        // hit, which moves the entry back to the young generation, takes the
+        // write lock, and looks again: another thread may have moved, replaced
+        // or evicted it in between.
+        {
+            let shard = self.read_shard(hash);
+            if let Some(ids) = shard.peek(hash, text) {
+                #[cfg(feature = "observe")]
+                if sample {
+                    shard.sample(ids.is_some(), text.len());
+                }
+                return ids;
+            }
+        }
+        let mut shard = self.write_shard(hash);
         let (ids, dropped) = shard.get(hash, text, self.young_budget);
         #[cfg(feature = "observe")]
         if sample {
-            let b = crate::observe::bucket(text.len() as u64);
-            match ids {
-                Some(_) => shard.obs.hit_sizes[b] += 1,
-                None => shard.obs.miss_sizes[b] += 1,
-            }
+            shard.sample(ids.is_some(), text.len());
         }
         // Free a dropped generation without holding the lock.
         drop(shard);
@@ -472,7 +566,7 @@ impl SegmentCache {
             text: text.into(),
             ids: ids.into(),
         };
-        let mut shard = self.lock_shard(hash);
+        let mut shard = self.write_shard(hash);
         shard.remove_old(hash);
         let dropped = shard.insert_young(hash, entry, self.young_budget);
         #[cfg(feature = "observe")]
@@ -506,28 +600,29 @@ impl SegmentCache {
         #[cfg(feature = "observe")]
         let (mut hits, mut misses, mut hit_bytes, mut miss_bytes) = (0u64, 0u64, 0u64, 0u64);
         for shard in self.shards.iter() {
-            let sh = shard.lock().unwrap();
+            let sh = shard.read().unwrap();
             entries += sh.young.len() + sh.old.len();
             bytes += sh.young_bytes + sh.old_bytes;
             #[cfg(feature = "observe")]
             {
                 let o = &sh.obs;
                 for b in 0..crate::observe::BUCKETS {
-                    hit_sizes[b] += o.hit_sizes[b];
-                    miss_sizes[b] += o.miss_sizes[b];
+                    hit_sizes[b] += o.hit_sizes[b].load(Relaxed);
+                    miss_sizes[b] += o.miss_sizes[b].load(Relaxed);
                 }
-                hits += sh.hits;
-                misses += sh.misses;
-                hit_bytes += sh.hit_bytes;
-                miss_bytes += sh.miss_bytes;
+                hits += sh.hits.load(Relaxed);
+                misses += sh.misses.load(Relaxed);
+                hit_bytes += sh.hit_bytes.load(Relaxed);
+                miss_bytes += sh.miss_bytes.load(Relaxed);
                 shards.push(serde_json::json!({
                     "young_entries": sh.young.len(), "young_bytes": sh.young_bytes,
                     "old_entries": sh.old.len(), "old_bytes": sh.old_bytes,
-                    "collisions": o.collisions, "promotions": o.promotions,
+                    "collisions": o.collisions.load(Relaxed), "promotions": o.promotions,
                     "inserts": o.inserts, "replaced": o.replaced,
                     "rotations": o.rotations,
                     "evicted_entries": o.evicted_entries, "evicted_bytes": o.evicted_bytes,
-                    "lock_contended": o.contended, "lock_wait_ns": o.wait_ns,
+                    "lock_contended": o.contended.load(Relaxed),
+                    "lock_wait_ns": o.wait_ns.load(Relaxed),
                 }));
             }
         }
@@ -571,11 +666,11 @@ impl SegmentCache {
             ..SegmentCacheStats::default()
         };
         for shard in self.shards.iter() {
-            let shard = shard.lock().unwrap();
-            stats.hits += shard.hits;
-            stats.misses += shard.misses;
-            stats.hit_bytes += shard.hit_bytes;
-            stats.miss_bytes += shard.miss_bytes;
+            let shard = shard.read().unwrap();
+            stats.hits += shard.hits.load(Relaxed);
+            stats.misses += shard.misses.load(Relaxed);
+            stats.hit_bytes += shard.hit_bytes.load(Relaxed);
+            stats.miss_bytes += shard.miss_bytes.load(Relaxed);
             stats.entries += shard.young.len() + shard.old.len();
             stats.bytes += shard.young_bytes + shard.old_bytes;
         }
@@ -698,6 +793,99 @@ mod tests {
         assert!(!cache.can_cache(512 - ENTRY_OVERHEAD + 1));
     }
 
+    /// A young hit and a miss go on while another thread reads the shard; an
+    /// old hit, which moves the entry, waits for it.
+    #[test]
+    fn lookups_share_a_shard_but_moving_an_entry_waits() {
+        let young = 1000;
+        let cache = Arc::new(SegmentCache::new(young * SHARDS * 2));
+        let key = |i: u64| (5u64 << 32) | i; // all in shard 5
+        let text = |i: u64| format!("entry {i:04}").into_bytes();
+        // Nine entries of 122 bytes: the ninth turns the first eight old.
+        for i in 0..9 {
+            cache.insert(key(i), &text(i), &[i as u32; 4]);
+        }
+        let reader = cache.shard(key(0)).read().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = cache.clone();
+        let t = std::thread::spawn(move || {
+            let young_hit = c.get(key(8), &text(8));
+            let miss = c.get(key(99), &text(99));
+            tx.send((young_hit, miss)).unwrap();
+            let old_hit = c.get(key(0), &text(0));
+            tx.send((old_hit, None)).unwrap();
+        });
+        let timeout = std::time::Duration::from_secs(10);
+        let (young_hit, miss) = rx.recv_timeout(timeout).expect("lookups blocked");
+        assert_eq!(young_hit.as_deref(), Some(&[8u32; 4][..]));
+        assert!(miss.is_none());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            rx.try_recv().is_err(),
+            "an old hit moved the entry under a read lock"
+        );
+        drop(reader);
+        let (old_hit, _) = rx.recv_timeout(timeout).unwrap();
+        assert_eq!(old_hit.as_deref(), Some(&[0u32; 4][..]));
+        t.join().unwrap();
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (2, 1));
+    }
+
+    /// Threads looking up, inserting and moving entries of one small cache at
+    /// once (every shard rotates many times) get the right ids, and every
+    /// lookup is counted once.
+    #[test]
+    fn concurrent_lookups_inserts_and_moves_stay_exact() {
+        let budget = SHARDS * 2 * 4096;
+        let cache = Arc::new(SegmentCache::new(budget));
+        let ids_for =
+            |k: u64| -> Vec<u32> { (0..(k % 7 + 1) as u32).map(|i| k as u32 * 8 + i).collect() };
+        let text_for = |k: u64| format!("{k}:{}", "z".repeat(k as usize % 200)).into_bytes();
+        let threads = 8u64;
+        let per = 20_000u64;
+        let totals: Vec<(u64, u64)> = (0..threads)
+            .map(|t| {
+                let c = cache.clone();
+                std::thread::spawn(move || {
+                    let (mut lookups, mut looked_bytes) = (0u64, 0u64);
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t + 1);
+                    for _ in 0..per {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        // A hot set every thread keeps hitting, and a long tail.
+                        let k = if x % 3 == 0 { x % 600 } else { x % 40 };
+                        let text = text_for(k);
+                        lookups += 1;
+                        looked_bytes += text.len() as u64;
+                        match ids_of(&c, &text) {
+                            Some(ids) => assert_eq!(&*ids, &ids_for(k)[..], "key {k}"),
+                            None => put(&c, &text, &ids_for(k)),
+                        }
+                    }
+                    (lookups, looked_bytes)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        let stats = cache.stats();
+        let lookups: u64 = totals.iter().map(|t| t.0).sum();
+        let looked_bytes: u64 = totals.iter().map(|t| t.1).sum();
+        assert_eq!(stats.hits + stats.misses, lookups);
+        assert_eq!(stats.hit_bytes + stats.miss_bytes, looked_bytes);
+        assert!(stats.hits > stats.misses, "{stats:?}");
+        assert!(stats.bytes <= budget, "{stats:?}");
+        for shard in cache.shards.iter() {
+            let sh = shard.read().unwrap();
+            let young: usize = sh.young.values().map(Entry::cost).sum();
+            let old: usize = sh.old.values().map(Entry::cost).sum();
+            assert_eq!((sh.young_bytes, sh.old_bytes), (young, old));
+        }
+    }
+
     #[test]
     fn observe_json_reports_size_in_every_build() {
         let cache = SegmentCache::new(SHARDS * 2 * 4096);
@@ -735,7 +923,7 @@ mod tests {
         /// costs, in every shard, after every operation.
         fn check_old_bytes(cache: &SegmentCache) {
             for (i, shard) in cache.shards.iter().enumerate() {
-                let sh = shard.lock().unwrap();
+                let sh = shard.read().unwrap();
                 let real: usize = sh.old.values().map(Entry::cost).sum();
                 assert_eq!(sh.old_bytes, real, "shard {i}");
             }
@@ -866,7 +1054,7 @@ mod tests {
             let cache = Arc::new(SegmentCache::new(1 << 20));
             let text = b"contended";
             let h = cache.key(text);
-            let guard = cache.shard(h).lock().unwrap();
+            let guard = cache.shard(h).write().unwrap();
             let c = cache.clone();
             let t = std::thread::spawn(move || c.get(h, text).is_none());
             std::thread::sleep(std::time::Duration::from_millis(30));

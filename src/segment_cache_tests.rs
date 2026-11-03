@@ -339,6 +339,64 @@ fn segment_cache_is_shared_safely_across_threads() {
     }
 }
 
+/// Eight threads replaying the same sessions through one tokenizer whose
+/// cache is too small for them, so they hit, insert and move the same entries
+/// at once: every request encodes as without the cache, and the cache counts
+/// every lookup once, as many as eight replays one after another make.
+#[test]
+fn segment_cache_counts_exactly_under_concurrent_use() {
+    let configs = configs();
+    for (name, build) in [&configs[0], &configs[4]] {
+        let plain = build();
+        let specials = specials_of(&plain);
+        let requests: Vec<String> = (0..3)
+            .flat_map(|s| chat_requests(300 + s, &specials, 30))
+            .collect();
+        let expected: Vec<Vec<u32>> = requests.iter().map(|r| plain.encode(r).unwrap()).collect();
+        // The lookups one replay makes, counted on a cache of its own.
+        let mut once = build();
+        once.enable_segment_cache(64 << 20);
+        for request in &requests {
+            once.encode(request).unwrap();
+        }
+        let per_replay = once.segment_cache_stats().unwrap();
+        let threads = 8;
+        let mut cached = build();
+        cached.enable_segment_cache(512 << 10);
+        let (cached, requests, expected) = (&cached, &requests, &expected);
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                scope.spawn(move || {
+                    // Each thread starts at its own request, so they overlap.
+                    let n = requests.len();
+                    for k in 0..n {
+                        let i = (k + t * n / threads) % n;
+                        assert_eq!(
+                            cached.encode(&requests[i]).unwrap(),
+                            expected[i],
+                            "{name}: thread {t}, request {i}"
+                        );
+                    }
+                });
+            }
+        });
+        let stats = cached.segment_cache_stats().unwrap();
+        let t = threads as u64;
+        assert_eq!(
+            stats.hits + stats.misses,
+            t * (per_replay.hits + per_replay.misses),
+            "{name}: {stats:?}"
+        );
+        assert_eq!(
+            stats.hit_bytes + stats.miss_bytes,
+            t * (per_replay.hit_bytes + per_replay.miss_bytes),
+            "{name}: {stats:?}"
+        );
+        assert!(stats.hits > stats.misses, "{name}: {stats:?}");
+        assert!(stats.bytes <= 512 << 10, "{name}: {stats:?}");
+    }
+}
+
 #[test]
 fn segment_cache_counts_lookups_and_ignores_plain_inputs() {
     let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
