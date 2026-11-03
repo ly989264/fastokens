@@ -606,7 +606,7 @@ impl Split {
         let chunk_results: Result<Vec<ChunkScan>, Error> = (0..actual)
             .into_par_iter()
             .map(|i| {
-                let _task = crate::observe::TaskGuard::start();
+                let _task = crate::observe::TaskGuard::start(crate::observe::JobKind::RegexSplit);
                 let auth_start = auth[i];
                 let chunk_end = snap_char_ceil(text, (auth[i + 1] + CHUNK_OVERLAP).min(text.len()));
                 // Search the text itself from `auth_start` (not a slice starting
@@ -741,7 +741,7 @@ impl Split {
         let chunk_results: Result<Vec<ChunkScan>, Error> = (0..actual)
             .into_par_iter()
             .map(|i| {
-                let _task = crate::observe::TaskGuard::start();
+                let _task = crate::observe::TaskGuard::start(crate::observe::JobKind::RegexSplit);
                 let auth_start = auth[i];
                 let chunk_end =
                     snap_char_ceil(input, (auth[i + 1] + CHUNK_OVERLAP).min(input.len()));

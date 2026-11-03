@@ -657,6 +657,11 @@ impl PyEncoding {
 
     #[getter(ids)]
     fn py_ids<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let _obs = ApiCall::start(
+            py,
+            fastokens::observe::Api::EncodingIds,
+            self.data.ids.len(),
+        );
         match self.prebuilt_ids.take() {
             Some(list) => Ok(list.into_bound(py)),
             None => u32_list(py, &self.data.ids),
@@ -678,6 +683,7 @@ impl PyEncoding {
 
     #[getter(attention_mask)]
     fn py_attention_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let _obs = ApiCall::start(py, fastokens::observe::Api::EncodingLists, self.ids.len());
         match &self.attention_mask {
             Some(v) => u32_list(py, v),
             None => repeat_list(py, 1, self.ids.len()),
@@ -690,6 +696,7 @@ impl PyEncoding {
 
     #[getter(type_ids)]
     fn py_type_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let _obs = ApiCall::start(py, fastokens::observe::Api::EncodingLists, self.ids.len());
         match &self.type_ids {
             Some(v) => u32_list(py, v),
             None => repeat_list(py, 0, self.ids.len()),
@@ -702,6 +709,7 @@ impl PyEncoding {
 
     #[getter(special_tokens_mask)]
     fn py_special_tokens_mask<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let _obs = ApiCall::start(py, fastokens::observe::Api::EncodingLists, self.ids.len());
         match &self.special_tokens_mask {
             Some(v) => u32_list(py, v),
             None => repeat_list(py, 0, self.ids.len()),
@@ -1055,6 +1063,8 @@ struct ApiCall {
     gil_released: bool,
     /// Time from the end of the GIL-free Rust work to holding the GIL again.
     gil_wait_ns: u64,
+    /// Time in Rust (the state lock included).
+    rust_ns: u64,
     timer: fastokens::observe::Timer,
 }
 
@@ -1076,15 +1086,42 @@ impl ApiCall {
             units,
             gil_released: false,
             gil_wait_ns: 0,
+            rust_ns: 0,
             timer: fastokens::observe::Timer::start(),
         }
     }
 
-    /// Run `f` with the GIL released, counting the wait to get it back.
-    fn allow_threads<T: Send>(&mut self, py: Python<'_>, f: impl FnOnce() -> T + Send) -> T {
-        self.gil_released = true;
-        let (out, back) = py.allow_threads(|| (f(), fastokens::observe::Timer::start()));
-        self.gil_wait_ns += back.ns();
+    /// Run the Rust work `f` (GIL held), counting its time.
+    fn rust<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        let t = fastokens::observe::Timer::start();
+        let out = f();
+        self.rust_ns += t.ns();
+        out
+    }
+
+    /// Run the Rust work `f`, with the GIL released when `release_gil` is
+    /// set, counting its time and the wait to get the GIL back.
+    fn run<T: Send>(
+        &mut self,
+        py: Python<'_>,
+        release_gil: bool,
+        f: impl FnOnce() -> T + Send,
+    ) -> T {
+        let timed = || {
+            let t = fastokens::observe::Timer::start();
+            let out = f();
+            (out, t.ns())
+        };
+        let (out, ns) = if release_gil {
+            self.gil_released = true;
+            let ((out, ns), back) =
+                py.allow_threads(|| (timed(), fastokens::observe::Timer::start()));
+            self.gil_wait_ns += back.ns();
+            (out, ns)
+        } else {
+            timed()
+        };
+        self.rust_ns += ns;
         out
     }
 }
@@ -1095,18 +1132,26 @@ impl Drop for ApiCall {
             self.api,
             self.units,
             self.timer.ns(),
+            self.rust_ns,
             self.gil_released,
             self.gil_wait_ns,
         );
     }
 }
 
-/// `fastokens.observe`'s process-wide snapshot as JSON: the thread pools, the
-/// threads, the encode paths, the API calls and the state-lock waits.
+/// `fastokens.observe`'s process-wide snapshot as JSON: stage times and
+/// cache counters by encode path, the BPE caches, the thread pools, the
+/// threads, the slowest encodes, the API calls and the state-lock waits.
 /// `{"enabled": false}` unless built with the `observe` feature.
 #[pyfunction]
 fn observe_snapshot() -> String {
     fastokens::observe::snapshot().to_string()
+}
+
+/// Forget the slowest encodes kept so far (to start a profile window).
+#[pyfunction]
+fn observe_reset_slow() {
+    fastokens::observe::reset_slow();
 }
 
 /// Whether this build was compiled with the `observe` feature.
@@ -1653,13 +1698,10 @@ impl PyTokenizer {
                 .encode_unpadded(&text, add_special_tokens, policy)
                 .map_err(|e| e.to_string())
         };
-        let processed = if text.len() >= GIL_RELEASE_MIN_BYTES {
-            obs.allow_threads(py, run)
-        } else {
-            run()
-        }
-        .map_err(PyValueError::new_err)?;
-        self.single_encoding(py, processed)
+        let processed = obs
+            .run(py, text.len() >= GIL_RELEASE_MIN_BYTES, run)
+            .map_err(PyValueError::new_err)?;
+        obs.rust(|| self.single_encoding(py, processed))
     }
 
     /// Encode through the base tokenizer pipeline without recognizing added
@@ -1680,13 +1722,10 @@ impl PyTokenizer {
                 .encode_unpadded(&text, false, fastokens::AddedTokenPolicy::None)
                 .map_err(|e| e.to_string())
         };
-        let processed = if text.len() >= GIL_RELEASE_MIN_BYTES {
-            obs.allow_threads(py, run)
-        } else {
-            run()
-        }
-        .map_err(PyValueError::new_err)?;
-        self.single_encoding(py, processed)
+        let processed = obs
+            .run(py, text.len() >= GIL_RELEASE_MIN_BYTES, run)
+            .map_err(PyValueError::new_err)?;
+        obs.rust(|| self.single_encoding(py, processed))
     }
 
     /// Encode a pre-segmented input, concatenating each segment's token ids.
@@ -1720,13 +1759,10 @@ impl PyTokenizer {
                 .encode_segments_unpadded(&segs)
                 .map_err(|e| e.to_string())
         };
-        let processed = if bytes >= GIL_RELEASE_MIN_BYTES {
-            obs.allow_threads(py, run)
-        } else {
-            run()
-        }
-        .map_err(PyValueError::new_err)?;
-        self.single_encoding(py, processed)
+        let processed = obs
+            .run(py, bytes >= GIL_RELEASE_MIN_BYTES, run)
+            .map_err(PyValueError::new_err)?;
+        obs.rust(|| self.single_encoding(py, processed))
     }
 
     /// Encode a batch of inputs in parallel.
@@ -1752,7 +1788,7 @@ impl PyTokenizer {
         // for the write lock with the GIL held. Snapshot padding with the batch
         // so a concurrent change cannot affect this call's result.
         let (batch, padding) = obs
-            .allow_threads(py, || {
+            .run(py, true, || {
                 let state = self.read();
                 let batch: Vec<ProcessedEncoding> = state
                     .inner
@@ -1762,14 +1798,18 @@ impl PyTokenizer {
             })
             .map_err(PyValueError::new_err)?;
 
-        // Padding is decided over the whole batch (e.g. to its longest).
-        let longest = batch.iter().map(|e| e.ids.len()).max().unwrap_or(0);
-        let encodings: Vec<EncodingData> = batch
-            .into_iter()
-            .map(|processed| build_encoding(processed, padding.as_ref(), longest))
-            .collect();
-        // The `ids` lists every caller goes on to read, built together on the pool.
-        let mut lists = prebuild_lists(py, &encodings)?.into_iter();
+        let (encodings, lists) = obs.rust(|| {
+            // Padding is decided over the whole batch (e.g. to its longest).
+            let longest = batch.iter().map(|e| e.ids.len()).max().unwrap_or(0);
+            let encodings: Vec<EncodingData> = batch
+                .into_iter()
+                .map(|processed| build_encoding(processed, padding.as_ref(), longest))
+                .collect();
+            // The `ids` lists every caller goes on to read, built together on the pool.
+            let lists = prebuild_lists(py, &encodings)?;
+            PyResult::Ok((encodings, lists))
+        })?;
+        let mut lists = lists.into_iter();
         encodings
             .into_iter()
             .map(|data| {
@@ -1813,7 +1853,7 @@ impl PyTokenizer {
         let bytes: usize = texts.iter().map(|t| t.len()).sum();
         let mut obs = ApiCall::start(py, fastokens::observe::Api::EncodeBatchFlat, bytes);
         let batch: Vec<Vec<u32>> = obs
-            .allow_threads(py, || {
+            .run(py, true, || {
                 // Keep the guard inside allow_threads, as in encode_batch.
                 self.read()
                     .inner
@@ -1904,10 +1944,8 @@ impl PyTokenizer {
     fn decode(&self, ids: &Bound<'_, PyAny>, skip_special_tokens: bool) -> PyResult<String> {
         let py = ids.py();
         let ids = Self::extract_decode_ids(ids)?;
-        let _obs = ApiCall::start(py, fastokens::observe::Api::Decode, ids.len());
-        self.read()
-            .inner
-            .decode(&ids, skip_special_tokens)
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::Decode, ids.len());
+        obs.rust(|| self.read().inner.decode(&ids, skip_special_tokens))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
@@ -1921,12 +1959,9 @@ impl PyTokenizer {
         let py = sentences.py();
         let sentences = Self::extract_decode_batch_ids(sentences)?;
         let units = sentences.iter().map(Vec::len).sum();
-        let _obs = ApiCall::start(py, fastokens::observe::Api::DecodeBatch, units);
-        let state = self.read();
+        let mut obs = ApiCall::start(py, fastokens::observe::Api::DecodeBatch, units);
         let refs: Vec<&[u32]> = sentences.iter().map(Vec::as_slice).collect();
-        state
-            .inner
-            .decode_batch(&refs, skip_special_tokens)
+        obs.rust(|| self.read().inner.decode_batch(&refs, skip_special_tokens))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
@@ -2176,5 +2211,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDecodeStream>()?;
     m.add_function(wrap_pyfunction!(observe_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(observe_enabled, m)?)?;
+    m.add_function(wrap_pyfunction!(observe_reset_slow, m)?)?;
     Ok(())
 }

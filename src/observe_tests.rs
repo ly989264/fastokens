@@ -77,7 +77,7 @@ fn a_repeated_request_is_all_hits() {
     assert_eq!(first, second);
     assert_eq!(a["enabled"], true);
     assert_eq!(a["scanner_path"], true);
-    assert_eq!(a["prefix_cache"], false);
+    assert!(a["prefix_cache"].is_null());
     let c = |v: &Value, k: &str| n(v, &["segment_cache", k]);
     // Text segments of CHAT: "user\nHello there", "assistant\nthe thing".
     assert_eq!((c(&a, "hits"), c(&a, "misses")), (0, 2));
@@ -85,6 +85,8 @@ fn a_repeated_request_is_all_hits() {
     assert_eq!(c(&b, "hit_bytes"), c(&a, "miss_bytes"));
     assert_eq!(c(&b, "entries"), 2);
     assert!(c(&b, "miss_tokenize_ns") > 0);
+    // All hits: no miss tokenizing is timed.
+    assert_eq!(c(&b, "miss_tokenize_ns"), c(&a, "miss_tokenize_ns"));
     let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
     assert!(plain.observe_json()["segment_cache"].is_null());
 }
@@ -121,4 +123,150 @@ fn long_inputs_and_batches_are_counted_as_pool_jobs() {
         assert!(workers.iter().all(|t| t["kind"] == "worker"));
         assert!(workers.iter().map(|t| n(t, &["tasks"])).sum::<u64>() > 0);
     }
+}
+
+/// `me`'s counter at `path` minus `before`'s.
+fn d(me: &Value, before: &Value, path: &[&str]) -> u64 {
+    n(me, path) - n(before, path)
+}
+
+const STAGES_FOR_TEST: [&str; 8] = [
+    "added_tokens",
+    "normalize",
+    "prefix_cache",
+    "pretokenize",
+    "model",
+    "cache_lookup",
+    "cache_assemble",
+    "post_process",
+];
+
+#[test]
+fn stages_land_on_the_path_that_ran_them() {
+    on_fresh_thread(|| {
+        let tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        let a = observe::current_thread();
+        tok.encode(CHAT).unwrap();
+        let b = observe::current_thread();
+        let st = |k: &str| d(&b, &a, &["stage_ns", k]);
+        assert!(st("added_tokens") > 0 && st("model") > 0, "{b}");
+        assert_eq!(
+            st("cache_lookup") + st("cache_assemble") + st("prefix_cache"),
+            0
+        );
+        let total: u64 = STAGES_FOR_TEST.iter().map(|k| st(k)).sum();
+        assert!(total <= d(&b, &a, &["encode_ns"]), "{total} > encode");
+
+        let mut cached = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        cached.enable_segment_cache(1 << 20);
+        cached.encode(CHAT).unwrap();
+        let c = observe::current_thread();
+        assert!(d(&c, &b, &["stage_ns", "cache_lookup"]) > 0);
+        assert!(
+            d(&c, &b, &["stage_ns", "model"]) > 0,
+            "misses are tokenized"
+        );
+        cached.encode(CHAT).unwrap();
+        let e = observe::current_thread();
+        assert!(d(&e, &c, &["stage_ns", "cache_lookup"]) > 0);
+        assert_eq!(
+            d(&e, &c, &["stage_ns", "model"]),
+            0,
+            "all hits: no model work"
+        );
+        assert_eq!(d(&e, &c, &["paths", "segments_cached"]), 1);
+        // Nested stages are part of the outer one: the sum stays within the
+        // encode time on every path.
+        let total: u64 = STAGES_FOR_TEST
+            .iter()
+            .map(|k| d(&e, &b, &["stage_ns", k]))
+            .sum();
+        assert!(total <= d(&e, &b, &["encode_ns"]), "{total} > encode");
+
+        let normalized = segment_test_tokenizer(
+            json!({"type": "NFC"}),
+            json!({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}),
+        );
+        let text = "the thing in the ring ".repeat(500);
+        let f = observe::current_thread();
+        normalized.encode(&text).unwrap();
+        let g = observe::current_thread();
+        assert!(d(&g, &f, &["stage_ns", "normalize"]) > 0);
+        assert!(d(&g, &f, &["stage_ns", "model"]) > 0);
+    });
+}
+
+#[test]
+fn bpe_cache_counters_follow_the_work() {
+    on_fresh_thread(|| {
+        let tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        // Under 64 KiB, so it all runs on this thread.
+        let text = (0..400).map(|i| format!("word{i} ")).collect::<String>();
+        let a = observe::current_thread();
+        let first = tok.encode(&text).unwrap();
+        let b = observe::current_thread();
+        let second = tok.encode(&text).unwrap();
+        let c = observe::current_thread();
+        assert_eq!(first, second);
+        let first_lookups = d(&b, &a, &["bpe", "fused_lookups"]);
+        assert!(first_lookups >= 400, "{b}");
+        assert!(d(&b, &a, &["bpe", "fused_misses"]) > 0);
+        assert!(d(&b, &a, &["bpe", "fused_misses"]) <= first_lookups);
+        assert!(d(&b, &a, &["bpe", "fused_merge_ns"]) > 0);
+        // The same pretokens again, all in this thread's cache now.
+        assert_eq!(d(&c, &b, &["bpe", "fused_lookups"]), first_lookups);
+        assert_eq!(d(&c, &b, &["bpe", "fused_misses"]), 0);
+        assert_eq!(d(&c, &b, &["bpe", "fused_merge_ns"]), 0);
+
+        // A pretoken over 15 bytes has no inline key; the long-pretoken cache
+        // keeps it, so only the first encode merges it.
+        let long = "a".repeat(40);
+        tok.encode(&long).unwrap();
+        tok.encode(&long).unwrap();
+        let e = observe::current_thread();
+        assert_eq!(d(&e, &c, &["bpe", "fused_misses"]), 1);
+        assert_eq!(d(&e, &c, &["bpe", "fused_uncacheable"]), 0);
+        assert_eq!(d(&e, &c, &["bpe", "fused_miss_bytes"]), 40);
+        // One led by a CJK character is kept by no cache: merged every time.
+        let cjk = "中文模型测试分词缓存"; // 30 bytes, one pretoken
+        tok.encode(cjk).unwrap();
+        tok.encode(cjk).unwrap();
+        let f = observe::current_thread();
+        assert_eq!(d(&f, &e, &["bpe", "fused_misses"]), 2);
+        assert_eq!(d(&f, &e, &["bpe", "fused_uncacheable"]), 2);
+        assert_eq!(d(&f, &e, &["bpe", "fused_miss_bytes"]), 60);
+    });
+}
+
+#[test]
+fn prefix_cache_counts_repeats_reuse_and_misses() {
+    on_fresh_thread(|| {
+        let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        tok.enable_input_cache(4);
+        let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        let base: String = (0..1500)
+            .map(|i| format!("line {i}: the thing\n"))
+            .collect();
+        let longer = format!("{base}Hello the end\n");
+        for text in [&base, &base, &longer] {
+            assert_eq!(tok.encode(text).unwrap(), plain.encode(text).unwrap());
+        }
+        let p = &tok.observe_json()["prefix_cache"];
+        assert_eq!(n(p, &["lookups"]), 3);
+        assert_eq!(n(p, &["misses"]), 1);
+        assert_eq!(n(p, &["exact_hits"]), 1);
+        assert_eq!(n(p, &["prefix_hits"]), 1);
+        assert!(n(p, &["reused_tokens"]) >= 256);
+        // The exact repeat reused all of `base`, the prefix hit nearly all.
+        assert!(n(p, &["reused_bytes"]) > base.len() as u64);
+        assert_eq!(
+            n(p, &["lookup_bytes"]),
+            (2 * base.len() + longer.len()) as u64
+        );
+        // Only the miss stores an encoding.
+        assert_eq!(n(p, &["entries"]), 1);
+        let me = observe::current_thread();
+        assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
+        assert!(plain.observe_json()["prefix_cache"].is_null());
+    });
 }

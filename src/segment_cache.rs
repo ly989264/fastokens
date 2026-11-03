@@ -368,15 +368,22 @@ impl SegmentCache {
         out: &mut Vec<u32>,
         tokenize: impl FnOnce(&mut Vec<u32>) -> Result<(), E>,
     ) -> Result<(), E> {
+        use crate::observe::{Stage, stage};
+        let lookup = stage(Stage::CacheLookup);
         let hash = self.key(text.as_bytes());
-        if let Some(ids) = self.get(hash, text.as_bytes()) {
+        let found = self.get(hash, text.as_bytes());
+        lookup.end();
+        if let Some(ids) = found {
+            let _stage = stage(Stage::CacheAssemble);
             out.extend_from_slice(&ids);
             return Ok(());
         }
         let start = out.len();
+        // The miss's own stages (the model's) are timed inside `tokenize`.
         let timer = crate::observe::Timer::start();
         tokenize(out)?;
         self.record_miss_tokenize(timer.ns());
+        let _stage = stage(Stage::CacheAssemble);
         self.insert(hash, text.as_bytes(), &out[start..]);
         Ok(())
     }

@@ -500,6 +500,22 @@ struct InputCache {
     capacity: usize,
     /// Most-recent-first LRU of cached encodings.
     entries: VecDeque<PrefixEntry>,
+    #[cfg(feature = "observe")]
+    obs: PrefixObs,
+}
+
+/// [`InputCache`]'s [`observe`] counters: lookups, which ended as an exact
+/// repeat, a reused prefix or nothing, and how many bytes and tokens of
+/// inputs the reuses covered.
+#[cfg(feature = "observe")]
+#[derive(Default)]
+struct PrefixObs {
+    lookups: u64,
+    exact: u64,
+    prefix: u64,
+    reused_bytes: u64,
+    reused_tokens: u64,
+    lookup_bytes: u64,
 }
 
 /// Longest common byte prefix of `a` and `b`, compared 8 bytes at a time.
@@ -534,7 +550,53 @@ impl InputCache {
         Self {
             capacity: capacity.max(1),
             entries: VecDeque::new(),
+            #[cfg(feature = "observe")]
+            obs: PrefixObs::default(),
         }
+    }
+
+    /// [`Self::reuse_plan`], counted for [`observe`].
+    #[inline]
+    fn reuse_plan_counted(&mut self, input: &[u8]) -> Option<Reuse> {
+        let plan = self.reuse_plan(input);
+        #[cfg(feature = "observe")]
+        {
+            let o = &mut self.obs;
+            o.lookups += 1;
+            o.lookup_bytes += input.len() as u64;
+            if let Some(r) = &plan {
+                if r.tail_start == input.len() {
+                    o.exact += 1;
+                } else {
+                    o.prefix += 1;
+                }
+                o.reused_bytes += r.tail_start as u64;
+                o.reused_tokens += r.tokens as u64;
+            }
+        }
+        plan
+    }
+
+    /// The cache's size and, with the `observe` feature, its counters.
+    fn observe_json(&self) -> serde_json::Value {
+        #[allow(unused_mut)]
+        let mut v = serde_json::json!({
+            "capacity": self.capacity,
+            "entries": self.entries.len(),
+            "bytes": self.entries.iter().map(|e| e.buf.len() + e.core_ids.len() * 4).sum::<usize>(),
+        });
+        #[cfg(feature = "observe")]
+        {
+            let o = &self.obs;
+            v["lookups"] = o.lookups.into();
+            v["exact_hits"] = o.exact.into();
+            v["prefix_hits"] = o.prefix.into();
+            v["misses"] = (o.lookups - o.exact - o.prefix).into();
+            v["lookup_bytes"] = o.lookup_bytes.into();
+            v["reused_bytes"] = o.reused_bytes.into();
+            v["reused_tokens"] = o.reused_tokens.into();
+        }
+        v
     }
 
     /// Drop every cached encoding. Required whenever the vocabulary changes,
@@ -1391,7 +1453,7 @@ impl Tokenizer {
         serde_json::json!({
             "enabled": observe::ENABLED,
             "scanner_path": self.scan_kind.is_some(),
-            "prefix_cache": self.input_cache.is_some(),
+            "prefix_cache": self.input_cache.as_ref().map(|c| c.lock().unwrap().observe_json()),
             "segment_cache": self.segment_cache.as_deref().map(segment_cache::SegmentCache::observe_json),
         })
     }
@@ -1548,6 +1610,7 @@ impl Tokenizer {
         let mut ids = Vec::new();
         for seg in segments {
             let timer = observe::Timer::start();
+            observe::begin_encode();
             // An untrusted segment is one split; the segment cache keys it by
             // its normalized text like a split between added tokens, which
             // tokenizes the same way. One too long to ever be cached skips it
@@ -1566,7 +1629,7 @@ impl Tokenizer {
             // Each segment counts as an encode; an empty one returns before
             // the pipeline and is not counted.
             if !seg.text.is_empty() {
-                observe::encode_done(seg.text.len(), timer.ns());
+                observe::encode_done(seg.text.len(), seg_ids.len(), timer.ns());
             }
             if ids.is_empty() {
                 ids = seg_ids;
@@ -1596,8 +1659,12 @@ impl Tokenizer {
         // Prefix cache: reuse the leading ids shared with a cached input
         // and tokenize only the tail, or reuse an exact repeat wholesale.
         if let Some(cache) = &self.input_cache {
-            let plan = cache.lock().unwrap().reuse_plan(buffer.as_bytes());
+            let plan = {
+                let _stage = observe::stage(observe::Stage::PrefixCache);
+                cache.lock().unwrap().reuse_plan_counted(buffer.as_bytes())
+            };
             if let Some(r) = plan {
+                let _stage = observe::stage(observe::Stage::Model);
                 let mut ids = Vec::with_capacity(r.tokens + (buffer.len() - r.tail_start) / 3 + 1);
                 ids.extend_from_slice(&r.core_ids[..r.tokens]);
                 if r.tail_start < buffer.len() {
@@ -1612,6 +1679,7 @@ impl Tokenizer {
                 return Ok(ids);
             }
             // Miss: full encode recording reuse boundaries, then cache it.
+            let model_stage = observe::stage(observe::Stage::Model);
             let scan_seg_rec = |seg: &str| {
                 let mut ids = Vec::with_capacity(seg.len() / 3 + 1);
                 let mut b = Vec::new();
@@ -1622,6 +1690,8 @@ impl Tokenizer {
             let (ids, bounds) =
                 crate::pre_tokenized::tokenize_scanned_with_bounds(buffer, kind, scan_seg_rec)
                     .map_err(Error::Model)?;
+            model_stage.end();
+            let _stage = observe::stage(observe::Stage::PrefixCache);
             cache
                 .lock()
                 .unwrap()
@@ -1629,6 +1699,7 @@ impl Tokenizer {
             return Ok(ids);
         }
 
+        let _stage = observe::stage(observe::Stage::Model);
         crate::pre_tokenized::tokenize_scanned(buffer, kind, scan_seg).map_err(Error::Model)
     }
 
@@ -1644,7 +1715,10 @@ impl Tokenizer {
         policy: AddedTokenPolicy,
     ) -> Option<Option<Vec<Segment<'a>>>> {
         if let Some(n) = &self.normalizer
-            && !n.is_identity_on(input)
+            && !{
+                let _stage = observe::stage(observe::Stage::Normalize);
+                n.is_identity_on(input)
+            }
         {
             return None;
         }
@@ -1653,6 +1727,7 @@ impl Tokenizer {
             AddedTokenPolicy::All => false,
             AddedTokenPolicy::SkipSpecial => true,
         };
+        let _stage = observe::stage(observe::Stage::AddedTokens);
         // Normalization is the identity here, so HF's second stage sees the raw
         // text pieces themselves.
         if let Some(ns) = &self.norm_split {
@@ -1712,12 +1787,17 @@ impl Tokenizer {
         policy: AddedTokenPolicy,
     ) -> Result<E, Error> {
         let timer = observe::Timer::start();
+        observe::begin_encode();
         let ids = self.encode_pipeline(input, policy)?;
+        let encoded: E = {
+            let _stage = observe::stage(observe::Stage::PostProcess);
+            self.truncate_and_post_process(ids, add_special_tokens)?
+        };
         // An empty input returns before the pipeline: not counted.
         if !input.is_empty() {
-            observe::encode_done(input.len(), timer.ns());
+            observe::encode_done(input.len(), encoded.ids().len(), timer.ns());
         }
-        self.truncate_and_post_process(ids, add_special_tokens)
+        Ok(encoded)
     }
 
     /// Truncate model ids, then post-process them, in HF's order: truncation
@@ -1776,6 +1856,12 @@ impl Tokenizer {
                 Some(_) => observe::Path::SegmentsCached,
                 None => observe::Path::ScanSplits,
             });
+            // The segment cache times its lookups and the scans of its misses
+            // itself; without it the whole loop is the model's.
+            let _stage = self
+                .segment_cache
+                .is_none()
+                .then(|| observe::stage(observe::Stage::Model));
             let mut ids = Vec::with_capacity(ids_capacity(input.len()));
             for seg in &segs {
                 match *seg {
@@ -1825,6 +1911,7 @@ impl Tokenizer {
         text: &str,
         ids: &mut Vec<u32>,
     ) -> Result<(), Error> {
+        let _stage = observe::stage(observe::Stage::Model);
         if crate::pre_tokenized::scans_whole(text.len()) {
             return self
                 .model
@@ -1873,6 +1960,7 @@ impl Tokenizer {
             && pts.buffer().len() <= u32::MAX as usize
         {
             observe::set_path(observe::Path::ScanSplits);
+            let _stage = observe::stage(observe::Stage::Model);
             let buffer = pts.buffer();
             let mut ids = Vec::with_capacity(buffer.len() / 3 + 1);
             for sp in pts.splits() {
@@ -1893,7 +1981,11 @@ impl Tokenizer {
         // the real three-`Split` sequence.
         if let Some(ref split) = self.split_only {
             observe::set_path(observe::Path::FusedSplit);
-            split.pre_tokenize(&mut pts)?;
+            {
+                let _stage = observe::stage(observe::Stage::Pretokenize);
+                split.pre_tokenize(&mut pts)?;
+            }
+            let _stage = observe::stage(observe::Stage::Model);
             let ids = pts
                 .tokenize_batched(|buf, splits, out| {
                     self.model.tokenize_batch_fused(buf, splits, out)
@@ -1903,6 +1995,7 @@ impl Tokenizer {
         }
 
         observe::set_path(observe::Path::General);
+        let pretokenize_stage = observe::stage(observe::Stage::Pretokenize);
         // 2. Pre-tokenize (refine splits in place).
         if let Some(ref pt) = self.pre_tokenizer {
             pt.pre_tokenize(&mut pts)?;
@@ -1918,8 +2011,10 @@ impl Tokenizer {
         {
             split_on_unbridgeable_bigrams(&mut pts, table);
         }
+        pretokenize_stage.end();
 
         // 3. Tokenize each text split with the model.
+        let _stage = observe::stage(observe::Stage::Model);
         pts.tokenize(|text, out| self.model.tokenize_into(text, out))
             .map_err(Error::Model)
     }
@@ -1986,7 +2081,7 @@ impl Tokenizer {
     ) -> Result<Vec<E>, Error> {
         let _job = observe::JobGuard::start(observe::JobKind::Batch, inputs.len());
         crate::fanout::map(inputs.len(), |i| {
-            let _task = observe::TaskGuard::start();
+            let _task = observe::TaskGuard::start(observe::JobKind::Batch);
             self.encode_unpadded(inputs[i].as_ref(), add_special_tokens, policy)
         })
         .into_iter()
@@ -2147,9 +2242,12 @@ impl Tokenizer {
         if let Some(ns) = &self.norm_split {
             return self.build_pre_tokenized_two_stage(ns, input, skip_special);
         }
-        let segments = match &self.added_tokens {
-            Some(at) => at.split_with(input, skip_special),
-            None => vec![Segment::Text(input)],
+        let segments = {
+            let _stage = observe::stage(observe::Stage::AddedTokens);
+            match &self.added_tokens {
+                Some(at) => at.split_with(input, skip_special),
+                None => vec![Segment::Text(input)],
+            }
         };
 
         // Fast path: if there's exactly one Text segment (no added token matches)
@@ -2177,7 +2275,10 @@ impl Tokenizer {
                         continue;
                     }
                     let normalized = match &self.normalizer {
-                        Some(n) => n.normalize(text),
+                        Some(n) => {
+                            let _stage = observe::stage(observe::Stage::Normalize);
+                            n.normalize(text)
+                        }
                         None => std::borrow::Cow::Borrowed(*text),
                     };
                     let start = buffer.len();
@@ -2212,7 +2313,11 @@ impl Tokenizer {
                 token_id: Some(id),
             });
         };
-        for seg in ns.split_raw(input, skip_special) {
+        let raw = {
+            let _stage = observe::stage(observe::Stage::AddedTokens);
+            ns.split_raw(input, skip_special)
+        };
+        for seg in raw {
             match seg {
                 Segment::Token(id) => push_token(&buffer, &mut splits, id),
                 Segment::Text(text) => {
@@ -2220,10 +2325,17 @@ impl Tokenizer {
                         continue;
                     }
                     let normalized = match &self.normalizer {
-                        Some(n) => n.normalize(text),
+                        Some(n) => {
+                            let _stage = observe::stage(observe::Stage::Normalize);
+                            n.normalize(text)
+                        }
                         None => std::borrow::Cow::Borrowed(text),
                     };
-                    for piece in ns.split_norm(&normalized, skip_special) {
+                    let pieces = {
+                        let _stage = observe::stage(observe::Stage::AddedTokens);
+                        ns.split_norm(&normalized, skip_special)
+                    };
+                    for piece in pieces {
                         match piece {
                             Segment::Token(id) => push_token(&buffer, &mut splits, id),
                             Segment::Text(t) if !t.is_empty() => {
@@ -2246,7 +2358,10 @@ impl Tokenizer {
     /// Normalize one input as a single text span, bypassing added vocabulary.
     fn build_pre_tokenized_ordinary(&self, input: &str) -> PreTokenizedString {
         let normalized = match &self.normalizer {
-            Some(normalizer) => normalizer.normalize(input),
+            Some(normalizer) => {
+                let _stage = observe::stage(observe::Stage::Normalize);
+                normalizer.normalize(input)
+            }
             None => std::borrow::Cow::Borrowed(input),
         };
         match normalized {

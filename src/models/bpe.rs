@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::Result;
 use crate::huge::HugeTable;
+use crate::observe as ob;
 use crate::pre_tokenizers::BYTE_TO_CHAR;
 
 type TokenId = u32;
@@ -1023,6 +1024,7 @@ impl PretokenCache {
         #[cfg(feature = "diag")]
         let _g = GrowTimer(std::time::Instant::now());
         if self.cap >= (1usize << PRETOKEN_CACHE_MAX_BITS) {
+            ob::bpe_add(ob::bpe::FUSED_CLEARS, 1);
             self.clear();
             return;
         }
@@ -3318,19 +3320,24 @@ impl Bpe {
         if input.is_empty() {
             return Ok(());
         }
+        ob::bpe_add(ob::bpe::GENERAL_CALLS, 1);
 
         // `ignore_merges`: a word that is itself a vocab entry is emitted as
         // is, even when merges cannot build it (so it is not in `daac`).
         if self.ignore_merges
             && let Some(&token) = self.token_to_id.get(input)
         {
+            ob::bpe_add(ob::bpe::GENERAL_EXACT, 1);
             out.push(token);
             return Ok(());
         }
 
         // With dropout, merge every call, like HF: no shortcut, no caches.
         if self.has_dropout() {
-            return self.merge_all_encoded_into(input, out);
+            let merge = ob::Timer::start();
+            let r = self.merge_all_encoded_into(input, out);
+            Self::count_general_merge(merge, input.len());
+            return r;
         }
 
         // Whole-word shortcut. Not with word affixes: the word's own vocab
@@ -3339,6 +3346,7 @@ impl Bpe {
             && let Some(token) = self.next_match(input)
             && self.token_lens[token as usize] as usize == input.len()
         {
+            ob::bpe_add(ob::bpe::GENERAL_EXACT, 1);
             out.push(token);
             return Ok(());
         }
@@ -3352,11 +3360,13 @@ impl Bpe {
             c.get(input, out)
         });
         if hit {
+            ob::bpe_add(ob::bpe::GENERAL_THREAD_HITS, 1);
             return Ok(());
         }
 
         let start = out.len();
         if self.shared_cache.get_into(input, out) {
+            ob::bpe_add(ob::bpe::GENERAL_SHARED_HITS, 1);
             TL_BPE_CACHE.with(|c| {
                 let mut c = c.borrow_mut();
                 if c.bpe_id != bpe_id {
@@ -3368,7 +3378,9 @@ impl Bpe {
             return Ok(());
         }
 
+        let merge = ob::Timer::start();
         self.merge_all_encoded_into(input, out)?;
+        Self::count_general_merge(merge, input.len());
 
         let ids = &out[start..];
         TL_BPE_CACHE.with(|c| {
@@ -3382,6 +3394,32 @@ impl Bpe {
         self.shared_cache.insert(input, ids);
 
         Ok(())
+    }
+
+    /// Count a general-path merge of `len` bytes that started at `merge`
+    /// ([`crate::observe`]).
+    #[inline(always)]
+    fn count_general_merge(merge: ob::Timer, len: usize) {
+        ob::bpe_miss(
+            ob::bpe::GENERAL_MERGES,
+            ob::bpe::GENERAL_MERGE_BYTES,
+            ob::bpe::GENERAL_MERGE_NS,
+            merge.ns(),
+            len,
+        );
+    }
+
+    /// Count a pretoken-cache miss of `len` bytes whose merge (or shared-table
+    /// or fold lookup) started at `merge` ([`crate::observe`]).
+    #[inline(always)]
+    fn count_fused_miss(merge: ob::Timer, len: usize) {
+        ob::bpe_miss(
+            ob::bpe::FUSED_MISSES,
+            ob::bpe::FUSED_MISS_BYTES,
+            ob::bpe::FUSED_MERGE_NS,
+            merge.ns(),
+            len,
+        );
     }
 
     /// Priority-queue BPE merge on already-encoded (ByteLevel) text.
@@ -4476,6 +4514,7 @@ impl Bpe {
         if raw_input.is_empty() {
             return Ok(());
         }
+        ob::bpe_add(ob::bpe::FUSED_LOOKUPS, 1);
 
         let bpe_id = self.id;
         let hit = TL_FUSED_CACHE.with(|c| {
@@ -4491,6 +4530,7 @@ impl Bpe {
         }
 
         let start = out.len();
+        let merge = ob::Timer::start();
         if self.ignore_merges
             && let Some(id) = self.whole_pretoken_id(raw_input)
         {
@@ -4498,6 +4538,7 @@ impl Bpe {
         } else {
             self.merge_all_raw_into(raw_input, out)?;
         }
+        Self::count_fused_miss(merge, raw_input.len());
 
         let ids = &out[start..];
         TL_FUSED_CACHE.with(|c| {
@@ -4521,6 +4562,7 @@ impl Bpe {
         }
 
         let start = out.len();
+        let merge = ob::Timer::start();
         if self.ignore_merges
             && let Some(id) = self.whole_pretoken_id(text)
         {
@@ -4528,6 +4570,7 @@ impl Bpe {
         } else {
             self.merge_all_raw_into(text, out)?;
         }
+        Self::count_fused_miss(merge, text.len());
         cache.insert(text, &out[start..]);
         Ok(())
     }
@@ -4556,6 +4599,7 @@ impl Bpe {
         let start = out.len();
         #[cfg(feature = "diag")]
         let t0 = std::time::Instant::now();
+        let merge = ob::Timer::start();
         // Keep in step with `miss_value_into` (the cache seed's values). A seeded
         // cache already holds every fold entry, so its misses skip the probe.
         if self.ignore_merges
@@ -4578,6 +4622,7 @@ impl Bpe {
             // lookup: not a token.)
             self.merge_all_raw_into(text, out)?;
         }
+        Self::count_fused_miss(merge, text.len());
         #[cfg(feature = "diag")]
         let t1 = std::time::Instant::now();
         cache.insert_at(key, hash, vacancy, &out[start..]);
@@ -4625,7 +4670,11 @@ impl Bpe {
             a[4] += 1;
             d.set(a);
         });
+        if h == 0 {
+            ob::bpe_add(ob::bpe::FUSED_UNCACHEABLE, 1);
+        }
         let start = out.len();
+        let merge = ob::Timer::start();
         if self.ignore_merges {
             // Exhaustive for > 15 bytes: a miss here answers the whole-pretoken
             // lookup (not a token) without re-encoding the text.
@@ -4645,6 +4694,7 @@ impl Bpe {
         } else {
             self.merge_all_raw_into(text, out)?;
         }
+        Self::count_fused_miss(merge, text.len());
         if h != 0 {
             cache.long.insert(text.as_bytes(), h, &out[start..]);
         }
@@ -4715,16 +4765,19 @@ impl Bpe {
                 self.bind_cache(&mut cache);
             }
 
+            let mut lookups = 0u64;
             for split in splits {
                 if let Some(id) = split.token_id {
                     out.push(id);
                 } else if !split.range.is_empty() {
                     let text = &buffer[split.range.clone()];
                     if !text.is_empty() {
+                        lookups += 1;
                         self.fused_one(text, &mut cache, out)?;
                     }
                 }
             }
+            ob::bpe_add(ob::bpe::FUSED_LOOKUPS, lookups);
             Ok(())
         })
     }
@@ -4833,6 +4886,7 @@ impl Bpe {
         out: &mut Vec<u32>,
     ) -> Result<()> {
         let n = chunk.n;
+        ob::bpe_add(ob::bpe::FUSED_LOOKUPS, n as u64);
         let spans = &chunk.p[..n];
         // Room for every span's inline ids: the unconditional store of one never
         // leaves the allocation (re-established after each slow path).
@@ -4959,6 +5013,7 @@ impl Bpe {
                     bounds.push((start as u32, out.len() as u32));
                 }
                 if start != end {
+                    ob::bpe_add(ob::bpe::FUSED_LOOKUPS, 1);
                     self.fused_one(&seg[start..end], &mut cache, out)?;
                 }
                 Ok(())
