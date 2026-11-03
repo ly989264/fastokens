@@ -12,7 +12,8 @@ use crate::{
     tiktoken::{self, TiktokenConfig},
 };
 
-const SCAN_SPECIALS: [&str; 4] = ["<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"];
+pub(crate) const SCAN_SPECIALS: [&str; 4] =
+    ["<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"];
 
 /// A tiktoken-style tokenizer for `pattern`: every byte, some merges so
 /// multi-byte tokens occur, and [`SCAN_SPECIALS`] as special tokens.

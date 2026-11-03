@@ -10,6 +10,7 @@ pub mod observe;
 pub mod post_processors;
 pub mod pre_tokenized;
 pub mod pre_tokenizers;
+mod prefix_cache;
 mod segment_cache;
 pub mod tiktoken;
 
@@ -172,10 +173,11 @@ pub use self::{
 };
 
 use self::{
-    added_tokens::Segment,
+    added_tokens::{Segment, SpannedSegment, TokenSpan},
     decoders::Decoder,
     post_processors::Encoding,
     pre_tokenized::{PreTokenizedString, Split as PtSplit},
+    prefix_cache::{Cut, Event, Outcome, PrefixCache},
 };
 
 #[cfg(feature = "hf-hub")]
@@ -668,15 +670,69 @@ impl InputCache {
     }
 }
 
-/// Build an [`InputCache`] from the `FASTOKENS_INPUT_CACHE` env var (a capacity),
-/// or `None` if unset — the default.
-fn input_cache_from_env() -> Option<Mutex<InputCache>> {
+/// The capacity set by the `FASTOKENS_INPUT_CACHE` env var, or `None` if unset
+/// — the default.
+fn input_cache_capacity_from_env() -> Option<usize> {
     std::env::var("FASTOKENS_INPUT_CACHE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&c| c >= 1)
-        .map(|c| Mutex::new(InputCache::new(c)))
 }
+
+/// Build an [`InputCache`] from the `FASTOKENS_INPUT_CACHE` env var (a capacity),
+/// or `None` if unset — the default.
+fn input_cache_from_env() -> Option<Mutex<InputCache>> {
+    input_cache_capacity_from_env().map(|c| Mutex::new(InputCache::new(c)))
+}
+
+/// The [`PrefixCache`]'s byte budget when `FASTOKENS_INPUT_CACHE_MIB` is unset.
+const DEFAULT_PREFIX_CACHE_MIB: usize = 2048;
+
+/// The smallest [`PrefixCache`] budget, as the env var allows: below 64 bytes
+/// the per-entry limit (1/64 of it) would turn every input away.
+const MIN_PREFIX_CACHE_BYTES: usize = 1 << 20;
+
+/// The [`PrefixCache`]'s byte budget: `FASTOKENS_INPUT_CACHE_MIB` (MiB), or
+/// [`DEFAULT_PREFIX_CACHE_MIB`] if it is unset or not a positive number.
+fn prefix_cache_max_bytes_from_env() -> usize {
+    std::env::var("FASTOKENS_INPUT_CACHE_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mib| mib >= 1)
+        .unwrap_or(DEFAULT_PREFIX_CACHE_MIB)
+        .saturating_mul(1 << 20)
+}
+
+/// Build a [`PrefixCache`] from the `FASTOKENS_INPUT_CACHE` env var, which
+/// sizes both prefix caches, or `None` if unset — the default.
+fn prefix_cache_from_env() -> Option<PrefixCache> {
+    input_cache_capacity_from_env().map(|c| PrefixCache::new(c, prefix_cache_max_bytes_from_env()))
+}
+
+/// The prefix cache's [`observe`] figures: the plain-text [`InputCache`]'s and
+/// the chat-template [`PrefixCache`]'s summed under the keys they share (one
+/// switch, one capacity), and the latter's own figures under `chat`.
+fn prefix_cache_json(
+    plain: Option<serde_json::Value>,
+    chat: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let (Some(mut sum), Some(chat)) = (plain.clone(), chat.clone()) else {
+        return plain.or(chat);
+    };
+    for (key, value) in sum.as_object_mut()? {
+        if key != "capacity"
+            && let (Some(a), Some(b)) = (value.as_u64(), chat[key].as_u64())
+        {
+            *value = (a + b).into();
+        }
+    }
+    sum["chat"] = chat;
+    Some(sum)
+}
+
+/// Stands in for an added token's id while the prefix cache encodes an input,
+/// so that the token's position in the output can be found.
+const SPAN_MARKER: u32 = u32::MAX - 1;
 
 /// Options applied while constructing a [`Tokenizer`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -803,6 +859,9 @@ pub struct Tokenizer {
     scan_kind: Option<crate::pre_tokenizers::scan::ScanKind>,
     /// Optional whole-input encoding cache; `None` (off) unless enabled.
     input_cache: Option<Mutex<InputCache>>,
+    /// Optional prefix cache for input with added tokens (chat templates);
+    /// enabled together with `input_cache`.
+    prefix_cache: Option<PrefixCache>,
     /// Optional cache of text-segment encodings; `None` (off) unless enabled.
     /// May be shared with copies (see [`Self::share_segment_cache_from`]).
     segment_cache: Option<Arc<segment_cache::SegmentCache>>,
@@ -948,6 +1007,7 @@ impl Tokenizer {
             split_only,
             scan_kind,
             input_cache: input_cache_from_env(),
+            prefix_cache: prefix_cache_from_env(),
             segment_cache,
             needs_vocab_splitting,
             truncation: json.truncation,
@@ -1137,6 +1197,7 @@ impl Tokenizer {
             split_only,
             scan_kind,
             input_cache: input_cache_from_env(),
+            prefix_cache: prefix_cache_from_env(),
             segment_cache,
             needs_vocab_splitting,
             truncation: None,
@@ -1378,17 +1439,26 @@ impl Tokenizer {
         self.added_tokens = added_tokens;
         self.norm_split = norm_split;
 
-        // Cached encodings were produced against the previous vocabulary. The
-        // segment cache may be shared with copies that keep that vocabulary,
-        // so this tokenizer moves to a fresh one rather than clearing it.
+        // Cached encodings were produced against the previous vocabulary.
+        self.clear_caches();
+
+        Ok(changed)
+    }
+
+    /// Drop every cached encoding, as needed whenever something they depend on
+    /// (the vocabulary, the normalizer) changes. The segment cache may be
+    /// shared with copies that keep the old one, so this tokenizer moves to a
+    /// fresh one rather than clearing it.
+    fn clear_caches(&mut self) {
         if let Some(cache) = &self.input_cache {
             cache.lock().unwrap().clear();
+        }
+        if let Some(cache) = &self.prefix_cache {
+            cache.clear();
         }
         if let Some(cache) = &mut self.segment_cache {
             *cache = Arc::new(segment_cache::SegmentCache::new(cache.max_bytes()));
         }
-
-        Ok(changed)
     }
 
     /// Return the decoder, if any.
@@ -1404,13 +1474,33 @@ impl Tokenizer {
         self.encode_with_special_tokens(input, false)
     }
 
-    /// Enable the opt-in prefix cache (see [`InputCache`]) retaining up to
-    /// `capacity` recent encodings. Reuses the leading token ids of inputs that
-    /// share a byte prefix (shared system prompts / long shared contexts), and
-    /// the whole encoding of an exact repeat. Leave it off for wholly-unique
-    /// traffic.
+    /// Enable the opt-in prefix cache retaining up to `capacity` recent
+    /// encodings (also enabled by `FASTOKENS_INPUT_CACHE=<capacity>`). Reuses
+    /// the leading token ids of inputs that share a byte prefix (shared system
+    /// prompts / long shared contexts), and the whole encoding of an exact
+    /// repeat. Leave it off for wholly-unique traffic.
+    ///
+    /// Input with added tokens, as chat-template output always is, goes
+    /// through [`PrefixCache`]: a request that re-sends a conversation reuses
+    /// the ids of the previous request up to the last added token they share.
+    /// That cache also keeps within a byte budget, `FASTOKENS_INPUT_CACHE_MIB`
+    /// or 2048 MiB (see [`Self::enable_input_cache_with_budget`]). Plain text
+    /// goes through [`InputCache`].
     pub fn enable_input_cache(&mut self, capacity: usize) {
+        self.enable_input_cache_with_budget(capacity, prefix_cache_max_bytes_from_env());
+    }
+
+    /// [`Self::enable_input_cache`] with the chat-template cache holding at
+    /// most `max_bytes` (at least 1 MiB) of inputs, ids and bookkeeping, about
+    /// 2.2 bytes per input byte. An input costing more than 1/64 of that is not
+    /// cached. The budget is this tokenizer's own, on top of its segment
+    /// cache's.
+    pub fn enable_input_cache_with_budget(&mut self, capacity: usize, max_bytes: usize) {
         self.input_cache = Some(Mutex::new(InputCache::new(capacity)));
+        self.prefix_cache = Some(PrefixCache::new(
+            capacity,
+            max_bytes.max(MIN_PREFIX_CACHE_BYTES),
+        ));
     }
 
     /// Enable the opt-in segment cache with a budget of `max_bytes` for segment
@@ -1453,7 +1543,10 @@ impl Tokenizer {
         serde_json::json!({
             "enabled": observe::ENABLED,
             "scanner_path": self.scan_kind.is_some(),
-            "prefix_cache": self.input_cache.as_ref().map(|c| c.lock().unwrap().observe_json()),
+            "prefix_cache": prefix_cache_json(
+                self.input_cache.as_ref().map(|c| c.lock().unwrap().observe_json()),
+                self.prefix_cache.as_ref().map(PrefixCache::observe_json),
+            ),
             "segment_cache": self.segment_cache.as_deref().map(segment_cache::SegmentCache::observe_json),
         })
     }
@@ -1788,7 +1881,7 @@ impl Tokenizer {
     ) -> Result<E, Error> {
         let timer = observe::Timer::start();
         observe::begin_encode();
-        let ids = self.encode_pipeline(input, policy)?;
+        let ids = self.encode_whole(input, policy)?;
         let encoded: E = {
             let _stage = observe::stage(observe::Stage::PostProcess);
             self.truncate_and_post_process(ids, add_special_tokens)?
@@ -1827,6 +1920,148 @@ impl Tokenizer {
                 p.pad(ids, target);
             }
         }
+    }
+
+    /// [`Self::encode_pipeline`] for a whole input, through the prefix cache
+    /// when it applies: enabled, and added tokens can split the input.
+    ///
+    /// Not for a tokenizer that matches some added tokens after normalization
+    /// (HF's second stage, see [`NormSplit`]): the cache cuts at added tokens
+    /// it finds in the raw text.
+    fn encode_whole(&self, input: &str, policy: AddedTokenPolicy) -> Result<Vec<u32>, Error> {
+        if let Some(cache) = &self.prefix_cache
+            && let Some(added) = &self.added_tokens
+            && !matches!(policy, AddedTokenPolicy::None)
+            && self.norm_split.is_none()
+        {
+            if (prefix_cache::BLOCK..=u32::MAX as usize).contains(&input.len()) {
+                return self.encode_prefix_cached(input, policy, cache, added);
+            }
+            cache.note(Event::BypassShort);
+        }
+        self.encode_pipeline(input, policy)
+    }
+
+    /// Encode `input` reusing the ids of the cached input it shares the
+    /// longest prefix with (see [`PrefixCache`]), and cache the result.
+    fn encode_prefix_cached(
+        &self,
+        input: &str,
+        policy: AddedTokenPolicy,
+        cache: &PrefixCache,
+        added: &AddedTokens,
+    ) -> Result<Vec<u32>, Error> {
+        let skip_special = matches!(policy, AddedTokenPolicy::SkipSpecial);
+        let bytes = input.as_bytes();
+        let (chain, hit) = {
+            let _stage = observe::stage(observe::Stage::PrefixCache);
+            let chain = PrefixCache::chain(bytes, u64::from(skip_special));
+            let hit = cache.lookup(bytes, &chain);
+            (chain, hit)
+        };
+
+        if let Some(h) = &hit
+            && h.lcp == bytes.len()
+            && h.lcp == h.entry.bytes.len()
+        {
+            cache.touch(h.entry_id());
+            let ids = h.entry.ids.to_vec();
+            cache.count(Outcome::Exact, bytes.len(), bytes.len(), ids.len());
+            return Ok(ids);
+        }
+
+        let reused = {
+            let _stage = observe::stage(observe::Stage::PrefixCache);
+            hit.as_ref().and_then(|h| {
+                let chosen =
+                    prefix_cache::choose_cut(&h.entry.cuts, h.lcp, added.max_token_len(), |pos| {
+                        added.match_ends_after(bytes, pos, h.lcp)
+                    });
+                let last = prefix_cache::last_shared_cut(&h.entry.cuts, h.lcp);
+                match (chosen, last) {
+                    (None, Some(_)) => cache.note(Event::NoCut),
+                    (Some(k), Some(l)) if k < l => cache.note(Event::CutBackoff),
+                    _ => {}
+                }
+                let k = chosen?;
+                let cut = h.entry.cuts[k];
+                Some((
+                    cut.start as usize,
+                    &h.entry.ids[..cut.ids_before as usize],
+                    &h.entry.cuts[..k],
+                ))
+            })
+        };
+        let (tail_start, prefix_ids, prefix_cuts) = reused.unwrap_or((0, &[], &[]));
+
+        let tail = &input[tail_start..];
+        let (pts, spans) = self.build_pre_tokenized_spans(tail, skip_special, added);
+        if spans.is_empty() {
+            // Plain text (nothing was reused: a cut starts at an added token).
+            // Not counted as a lookup here: on the scanner path the plain-text
+            // cache looks it up again and counts that, so the summed totals
+            // count each input once; on other paths it is counted nowhere.
+            cache.note(Event::BypassPlain);
+            return self.tokenize_pre_tokenized(pts);
+        }
+        let mut tail_ids = match &self.segment_cache {
+            Some(seg) if pts.splits().len() > 1 => {
+                let ids = self.tokenize_splits_cached(&pts, seg)?;
+                observe::set_path(observe::Path::SegmentsCached);
+                ids
+            }
+            _ => self.tokenize_pre_tokenized(pts)?,
+        };
+
+        // Put the added tokens' ids back, recording where each one landed.
+        let mut cuts = Vec::with_capacity(prefix_cuts.len() + spans.len());
+        cuts.extend_from_slice(prefix_cuts);
+        let mut spans_left = spans.iter();
+        for (i, id) in tail_ids.iter_mut().enumerate() {
+            if *id != SPAN_MARKER {
+                continue;
+            }
+            let Some(span) = spans_left.next() else {
+                // A model id equal to the marker: don't cache this input.
+                cache.note(Event::MarkerFallback);
+                return self.encode_pipeline(input, policy);
+            };
+            *id = span.id;
+            let content = tail_start + span.content;
+            cuts.push(Cut {
+                // Never after the token's own text, should a split ever start
+                // a span inside whitespace an earlier token absorbed.
+                start: (tail_start + span.start.min(span.content)) as u32,
+                content: content as u32,
+                content_end: (content + added.token_len(span.id)) as u32,
+                ids_before: (prefix_ids.len() + i) as u32,
+            });
+        }
+        if spans_left.next().is_some() {
+            cache.note(Event::MarkerFallback);
+            return self.encode_pipeline(input, policy);
+        }
+
+        let outcome = if prefix_ids.is_empty() {
+            Outcome::Miss
+        } else {
+            Outcome::Prefix
+        };
+        cache.count(outcome, bytes.len(), tail_start, prefix_ids.len());
+        let mut ids = Vec::with_capacity(prefix_ids.len() + tail_ids.len());
+        ids.extend_from_slice(prefix_ids);
+        ids.extend_from_slice(&tail_ids);
+        {
+            let _stage = observe::stage(observe::Stage::PrefixCache);
+            cache.insert(
+                bytes,
+                ids.as_slice().into(),
+                cuts.into(),
+                chain,
+                hit.as_ref(),
+            );
+        }
+        Ok(ids)
     }
 
     /// The model's ids for `input`, before truncation and post-processing.
@@ -2097,6 +2332,8 @@ impl Tokenizer {
     /// Replace the normalizer.
     pub fn set_normalizer(&mut self, normalizer: Option<Normalizer>) {
         self.normalizer = normalizer;
+        // Cached encodings were normalized the old way.
+        self.clear_caches();
     }
 
     /// Post-process model ids (or a [`post_processors::ProcessedEncoding`] of
@@ -2270,29 +2507,68 @@ impl Tokenizer {
                         token_id: Some(*id),
                     });
                 }
-                Segment::Text(text) => {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let normalized = match &self.normalizer {
-                        Some(n) => {
-                            let _stage = observe::stage(observe::Stage::Normalize);
-                            n.normalize(text)
-                        }
-                        None => std::borrow::Cow::Borrowed(*text),
-                    };
-                    let start = buffer.len();
-                    buffer.push_str(&normalized);
-                    let end = buffer.len();
-                    splits.push(PtSplit {
-                        range: start..end,
-                        token_id: None,
-                    });
-                }
+                Segment::Text(text) => self.push_normalized(&mut buffer, &mut splits, text),
             }
         }
 
         PreTokenizedString::new(buffer, splits)
+    }
+
+    /// [`Self::build_pre_tokenized_with`] for the prefix cache: also returns
+    /// the spans of the added tokens, whose ids are left as [`SPAN_MARKER`]
+    /// so that their positions in the output can be found. Single-stage
+    /// matching only (see [`Self::encode_whole`]).
+    fn build_pre_tokenized_spans(
+        &self,
+        input: &str,
+        skip_special: bool,
+        added: &AddedTokens,
+    ) -> (PreTokenizedString, Vec<TokenSpan>) {
+        let segments = {
+            let _stage = observe::stage(observe::Stage::AddedTokens);
+            added.split_spans(input, skip_special)
+        };
+        let mut spans = Vec::new();
+        if let [SpannedSegment::Text(text)] = segments[..] {
+            return (self.build_pre_tokenized_ordinary(text), spans);
+        }
+
+        let mut buffer = String::with_capacity(input.len());
+        let mut splits = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match seg {
+                SpannedSegment::Token(span) => {
+                    let start = buffer.len();
+                    splits.push(PtSplit {
+                        range: start..start,
+                        token_id: Some(SPAN_MARKER),
+                    });
+                    spans.push(span);
+                }
+                SpannedSegment::Text(text) => self.push_normalized(&mut buffer, &mut splits, text),
+            }
+        }
+        (PreTokenizedString::new(buffer, splits), spans)
+    }
+
+    /// Append `text`, normalized, to `buffer` as a text split.
+    fn push_normalized(&self, buffer: &mut String, splits: &mut Vec<PtSplit>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let normalized = match &self.normalizer {
+            Some(n) => {
+                let _stage = observe::stage(observe::Stage::Normalize);
+                n.normalize(text)
+            }
+            None => std::borrow::Cow::Borrowed(text),
+        };
+        let start = buffer.len();
+        buffer.push_str(&normalized);
+        splits.push(PtSplit {
+            range: start..buffer.len(),
+            token_id: None,
+        });
     }
 
     /// [`Self::build_pre_tokenized_with`] under HF's two-stage added-token matching
@@ -4675,6 +4951,9 @@ mod ordinary_tests;
 
 #[cfg(test)]
 mod segment_cache_tests;
+
+#[cfg(test)]
+mod prefix_cache_tests;
 
 #[cfg(all(test, feature = "observe"))]
 mod observe_tests;

@@ -149,17 +149,44 @@ tables are built from the same `regex-syntax` data the reference matcher uses,
 so results are identical). This makes single-document ("1M context")
 tokenization several times faster than the regex path on those models.
 
-### Prefix cache (shared system prompts)
+### Prefix cache (shared prefixes and multi-turn chat)
 
-For serving workloads where many requests share a long prefix — a common system
-prompt or a large shared context — an opt-in prefix cache tokenizes the shared
-prefix once and reuses its token ids, tokenizing only each request's unique
-tail. Enable it with `FASTOKENS_INPUT_CACHE=<capacity>` (number of recent
-prefixes to retain) or `Tokenizer::enable_input_cache(capacity)` in Rust; it is
-off by default. Reuse cuts are only ever made at hard pretoken boundaries, so
-results are bit-identical to tokenizing from scratch. On a ~1M-token shared
-prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact repeat
-reuses the whole encoding.
+For serving workloads where requests share a long prefix — a common system
+prompt, a large shared context, or the conversation a chat or coding agent
+re-sends on every turn — an opt-in prefix cache tokenizes the shared prefix
+once and reuses its token ids, tokenizing only each request's unique tail.
+Enable it with `FASTOKENS_INPUT_CACHE=<capacity>` (number of recent inputs to
+retain) or `Tokenizer::enable_input_cache(capacity)` in Rust; it is off by
+default. Results are bit-identical to tokenizing from scratch. On a ~1M-token
+shared prefix this takes per-request encoding from ~2.9 ms to ~0.6 ms; an exact
+repeat reuses the whole encoding.
+
+Chat-template output (input with special tokens) is matched against the cached
+input it shares the longest byte prefix with and reused up to the last special
+token inside that prefix. A request that continues that entry's conversation
+then replaces it, so the next request of the same conversation finds it; a
+request of another conversation that only shares, say, the system prompt
+leaves it alone. It reuses nothing after the first byte a chat template
+rewrites (for example reasoning dropped from earlier turns); enabled together
+with the segment cache, the rest of such a request goes through the segment
+cache. A tokenizer whose added tokens are matched after normalization
+(`normalized: true` with a normalizer) does not use this part of the cache.
+
+Memory: an entry costs its text, 4 bytes per token and a little bookkeeping,
+about 2.2 bytes per byte of input, and one entry per active conversation is
+what reuse needs. The chat-template cache keeps both limits: `capacity`
+entries and a byte budget, `FASTOKENS_INPUT_CACHE_MIB=<MiB>` (default 2048, or
+`Tokenizer::enable_input_cache_with_budget(capacity, bytes)` in Rust), evicting
+the least recently used entry when either is exceeded. An input whose entry
+would cost more than 1/64 of the budget is not cached. Size the capacity at 1.5
+to 2 times the number of concurrent conversations: requests that rewrite much
+of their history leave the old entry until it is evicted. For example, 256
+coding-agent sessions sending ~100K-token requests held 283-290 MiB in 375-382
+entries. The plain-text part of the cache is limited by `capacity` alone.
+Budgets are per `Tokenizer` instance, and every copy in a pool of tokenizers
+(vLLM keeps one per worker thread) holds its own prefix cache, on top of the
+segment cache it shares with the others (see below). The Rust API raises a
+budget below 1 MiB to 1 MiB.
 
 ### Segment cache (chat and agent traffic)
 
@@ -167,7 +194,7 @@ A chat or coding-agent request is the whole conversation so far, rendered by
 the chat template: text segments between special tokens. Each request repeats
 nearly all of the previous one, but not as a byte prefix: templates drop the
 reasoning of earlier turns and agents compact their context, and the prefix
-cache never sees chat-template output in any case. The opt-in segment cache
+cache reuses nothing after the first byte that changed. The opt-in segment cache
 stores each text segment's token ids by content and reuses them wherever the
 segment appears next, tokenizing only the segments it has not seen. A
 segment's ids depend on nothing but its normalized text, and every hit is

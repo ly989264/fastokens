@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     observe,
+    prefix_cache_tests::{prefix_byte_level, prefix_test_tokenizer},
     segment_cache_tests::{scan_test_tokenizer, segment_test_tokenizer},
     tiktoken,
 };
@@ -268,5 +269,99 @@ fn prefix_cache_counts_repeats_reuse_and_misses() {
         let me = observe::current_thread();
         assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
         assert!(plain.observe_json()["prefix_cache"].is_null());
+    });
+}
+
+#[test]
+fn prefix_cache_counts_chat_template_repeats_reuse_and_misses() {
+    on_fresh_thread(|| {
+        let mut tok = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        tok.enable_input_cache(4);
+        let plain = scan_test_tokenizer(tiktoken::O200K_BASE_PATTERN);
+        let base: String = (0..300)
+            .map(|i| format!("<|im_start|>user\nline {i}: the thing<|im_end|>\n"))
+            .collect();
+        let longer = format!("{base}<|im_start|>assistant\nHello<|im_end|>\n");
+        for text in [&base, &base, &longer] {
+            assert_eq!(tok.encode(text).unwrap(), plain.encode(text).unwrap());
+        }
+        let p = &tok.observe_json()["prefix_cache"];
+        assert_eq!(n(p, &["lookups"]), 3);
+        assert_eq!(n(p, &["misses"]), 1);
+        assert_eq!(n(p, &["exact_hits"]), 1);
+        assert_eq!(n(p, &["prefix_hits"]), 1);
+        assert!(n(p, &["reused_bytes"]) > base.len() as u64);
+        assert_eq!(
+            n(p, &["lookup_bytes"]),
+            (2 * base.len() + longer.len()) as u64
+        );
+        // The miss stored `base`, which `longer` then replaced.
+        assert_eq!(n(p, &["entries"]), 1);
+        let me = observe::current_thread();
+        assert!(n(&me, &["stage_ns", "prefix_cache"]) > 0);
+
+        // Too short for the chat path, and without added tokens.
+        tok.encode("<|im_start|>hi<|im_end|>").unwrap();
+        tok.encode(&"plain text line\n".repeat(400)).unwrap();
+        let p = &tok.observe_json()["prefix_cache"];
+        let c = &p["chat"];
+        // Neither is counted as a lookup here.
+        assert_eq!((n(c, &["lookups"]), n(c, &["misses"])), (3, 1));
+        assert_eq!((n(c, &["bypass_short"]), n(c, &["bypass_plain"])), (1, 1));
+        assert_eq!(
+            (
+                n(c, &["inserts"]),
+                n(c, &["replaced"]),
+                n(c, &["evicted_entries"])
+            ),
+            (2, 1, 0)
+        );
+        assert_eq!(
+            n(c, &["reused_bytes"]) + n(c, &["encoded_bytes"]),
+            n(c, &["lookup_bytes"])
+        );
+        // The totals add the plain-text cache's lookup of the plain text.
+        assert_eq!(n(p, &["lookups"]), 4);
+
+        // A normalizer change drops the entry, counted as cleared.
+        tok.set_normalizer(None);
+        let c = &tok.observe_json()["prefix_cache"]["chat"];
+        assert_eq!((n(c, &["entries"]), n(c, &["cleared_entries"])), (0, 1));
+        assert_eq!(
+            n(c, &["inserts"]),
+            n(c, &["replaced"]) + n(c, &["evicted_entries"]) + n(c, &["cleared_entries"])
+        );
+    });
+}
+
+#[test]
+fn prefix_cache_counts_cut_backoffs_and_evictions() {
+    on_fresh_thread(|| {
+        let plain = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        let mut tok = prefix_test_tokenizer(Value::Null, prefix_byte_level());
+        tok.enable_input_cache(2);
+        let body = |w: &str| format!("{w} ").repeat(1500);
+        let inputs = [
+            // `<|b|>` ends the cached input; the next one turns it
+            // into part of `x<|b|>y`, so reuse backs off to `<|a|>`.
+            format!("<|c|>{}<|a|>x<|b|>", body("one")),
+            format!("<|c|>{}<|a|>x<|b|>y tail", body("one")),
+            // The only shared token is ruled out the same way.
+            format!("{}x<|b|>", body("two")),
+            format!("{}x<|b|>y tail", body("two")),
+            // A third conversation evicts the oldest of two entries.
+            format!("<|a|>{}<|a|>", body("three")),
+        ];
+        for text in &inputs {
+            assert_eq!(tok.encode(text).unwrap(), plain.encode(text).unwrap());
+        }
+        let c = &tok.observe_json()["prefix_cache"]["chat"];
+        assert_eq!(n(c, &["cut_backoffs"]), 1);
+        assert_eq!(n(c, &["no_cut"]), 1);
+        assert_eq!((n(c, &["prefix_hits"]), n(c, &["misses"])), (1, 4));
+        assert_eq!(n(c, &["inserts"]), 5);
+        assert_eq!(n(c, &["evicted_entries"]), 5 - n(c, &["replaced"]) - 2);
+        assert!(n(c, &["evicted_bytes"]) > 0);
+        assert_eq!(n(c, &["entries"]), 2);
     });
 }

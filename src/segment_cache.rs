@@ -68,7 +68,7 @@ const ENTRY_OVERHEAD: usize = 96;
 /// It is not collision-resistant and need not be: a hit is confirmed by
 /// comparing the stored text, so a collision only costs a cache miss. Nor is
 /// it keyed, so it never indexes a map directly; see [`SegmentCache::key`].
-fn hash_bytes(bytes: &[u8]) -> u64 {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     #[inline(always)]
     fn round(acc: u64, word: u64) -> u64 {
@@ -110,7 +110,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 
 /// Map hasher for keys that are already [`hash_bytes`] outputs.
 #[derive(Default)]
-struct PassThrough(u64);
+pub(crate) struct PassThrough(u64);
 
 impl Hasher for PassThrough {
     fn finish(&self) -> u64 {
@@ -126,7 +126,7 @@ impl Hasher for PassThrough {
     }
 }
 
-type HashMapU64<V> = HashMap<u64, V, BuildHasherDefault<PassThrough>>;
+pub(crate) type HashMapU64<V> = HashMap<u64, V, BuildHasherDefault<PassThrough>>;
 
 struct Entry {
     text: Box<[u8]>,

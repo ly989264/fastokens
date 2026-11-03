@@ -114,6 +114,24 @@ pub enum Segment<'a> {
     Text(&'a str),
 }
 
+/// An added-token match with its position in the input: `start..end` is the
+/// whole span, including whitespace absorbed by `lstrip`/`rstrip`, and the
+/// token's own text starts at `content`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TokenSpan {
+    pub id: u32,
+    pub start: usize,
+    pub content: usize,
+    pub end: usize,
+}
+
+/// A [`Segment`] whose added tokens carry their [`TokenSpan`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpannedSegment<'a> {
+    Token(TokenSpan),
+    Text(&'a str),
+}
+
 /// Public view of one added-token entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddedTokenInfo<'a> {
@@ -377,11 +395,76 @@ impl AddedTokens {
         input: &'a str,
         skip_special: bool,
     ) -> Option<Vec<Segment<'a>>> {
+        let mut segments = Vec::new();
+        self.split_each(input, skip_special, |seg| {
+            segments.push(match seg {
+                SpannedSegment::Token(span) => Segment::Token(span.id),
+                SpannedSegment::Text(text) => Segment::Text(text),
+            })
+        })?;
+        Some(segments)
+    }
+
+    /// Whether splits scan with the full automaton rather than a prefilter.
+    #[cfg(test)]
+    pub(crate) fn uses_full_scan(&self) -> bool {
+        !self.prefilter && self.teddy.is_none()
+    }
+
+    /// [`Self::split_with`], keeping each added token's position in `input`.
+    pub(crate) fn split_spans<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+    ) -> Vec<SpannedSegment<'a>> {
+        let mut segments = Vec::new();
+        if self
+            .split_each(input, skip_special, |seg| segments.push(seg))
+            .is_none()
+            && !input.is_empty()
+        {
+            segments.push(SpannedSegment::Text(input));
+        }
+        segments
+    }
+
+    /// Longest added token in bytes.
+    pub(crate) fn max_token_len(&self) -> usize {
+        self.max_token_len
+    }
+
+    /// Length in bytes of added token `id`'s text (0 for other ids).
+    pub(crate) fn token_len(&self, id: u32) -> usize {
+        self.token_lens.get(id as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether an added token matching `bytes` at `pos` ends after `limit`.
+    ///
+    /// Matching is leftmost-longest, so only the longest token starting at
+    /// `pos` can be taken there, and it is the one checked.
+    pub(crate) fn match_ends_after(&self, bytes: &[u8], pos: usize, limit: usize) -> bool {
+        let window = &bytes[pos..(pos + self.max_token_len).min(bytes.len())];
+        self.daac
+            .leftmost_find_iter(window)
+            .next()
+            .is_some_and(|m| m.start() == 0 && pos + m.end() > limit)
+    }
+
+    /// Run the split, handing each segment to `emit` in order; `None`, having
+    /// emitted nothing, when the prefilter finds no match (the whole input is
+    /// one text segment).
+    fn split_each<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+        emit: impl FnMut(SpannedSegment<'a>),
+    ) -> Option<()> {
         // When there are few distinct start bytes, use SIMD memchr to skip
         // positions that cannot start any added token. This avoids scanning
         // the full input through the Aho-Corasick automaton.
         if !self.prefilter && self.teddy.is_none() {
-            return Some(self.split_full_scan(input, skip_special));
+            self.split_full_scan(input, skip_special, emit);
+            return Some(());
         }
         let n = input.len();
         let threads = crate::fanout::threads();
@@ -412,7 +495,8 @@ impl AddedTokens {
         if hits.is_empty() {
             return None;
         }
-        Some(self.segments_from_hits(input, &hits, skip_special))
+        self.segments_from_hits(input, &hits, skip_special, emit);
+        Some(())
     }
 
     /// The Teddy prefilter's candidates in `lo..hi` (see [`Self::candidates`]), as
@@ -551,8 +635,9 @@ impl AddedTokens {
         input: &'a str,
         hits: &[(usize, usize, u32)],
         skip_special: bool,
-    ) -> Vec<Segment<'a>> {
-        let mut segments = Vec::new();
+        mut emit: impl FnMut(SpannedSegment<'a>),
+    ) {
+        let mut emitted = false;
         let mut prev_end = 0;
         // End of the last match, emitted or not. A match consumes its own span
         // (not whitespace it strips), so a candidate inside it cannot start a
@@ -570,20 +655,25 @@ impl AddedTokens {
                 continue;
             };
             if start > prev_end {
-                segments.push(Segment::Text(&input[prev_end..start]));
+                emit(SpannedSegment::Text(&input[prev_end..start]));
             }
-            segments.push(Segment::Token(id));
+            emit(SpannedSegment::Token(TokenSpan {
+                id,
+                start,
+                content: pos,
+                end,
+            }));
+            emitted = true;
             prev_end = end;
         }
 
         if prev_end < input.len() {
-            segments.push(Segment::Text(&input[prev_end..]));
+            emit(SpannedSegment::Text(&input[prev_end..]));
+            emitted = true;
         }
-        if segments.is_empty() && !input.is_empty() {
-            segments.push(Segment::Text(input));
+        if !emitted && !input.is_empty() {
+            emit(SpannedSegment::Text(input));
         }
-
-        segments
     }
 
     /// Resolve a match at `start..end` to the span its token covers, following
@@ -625,8 +715,12 @@ impl AddedTokens {
     }
 
     /// Full-scan fallback for >3 distinct start bytes.
-    fn split_full_scan<'a>(&self, input: &'a str, skip_special: bool) -> Vec<Segment<'a>> {
-        let mut segments = Vec::new();
+    fn split_full_scan<'a>(
+        &self,
+        input: &'a str,
+        skip_special: bool,
+        mut emit: impl FnMut(SpannedSegment<'a>),
+    ) {
         let mut prev_end = 0;
 
         for m in self.daac.leftmost_find_iter(input) {
@@ -639,17 +733,20 @@ impl AddedTokens {
                 continue;
             };
             if start > prev_end {
-                segments.push(Segment::Text(&input[prev_end..start]));
+                emit(SpannedSegment::Text(&input[prev_end..start]));
             }
-            segments.push(Segment::Token(m.value()));
+            emit(SpannedSegment::Token(TokenSpan {
+                id: m.value(),
+                start,
+                content: m.start(),
+                end,
+            }));
             prev_end = end;
         }
 
         if prev_end < input.len() {
-            segments.push(Segment::Text(&input[prev_end..]));
+            emit(SpannedSegment::Text(&input[prev_end..]));
         }
-
-        segments
     }
 }
 
@@ -819,9 +916,16 @@ mod tests {
                     text.push_str(alphabet[(state % alphabet.len() as u64) as usize]);
                 }
                 for skip_special in [false, true] {
+                    let mut full = Vec::new();
+                    at.split_full_scan(&text, skip_special, |seg| {
+                        full.push(match seg {
+                            SpannedSegment::Token(span) => Segment::Token(span.id),
+                            SpannedSegment::Text(text) => Segment::Text(text),
+                        })
+                    });
                     assert_eq!(
                         at.split_with(&text, skip_special),
-                        at.split_full_scan(&text, skip_special),
+                        full,
                         "configs={configs:?} round={round} skip_special={skip_special}"
                     );
                 }

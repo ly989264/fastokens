@@ -8,9 +8,11 @@ reference implementation (HF `tokenizers`, or `tiktoken` for Kimi):
   encode           chat-templated prompt, special tokens recognized
   encode+cache     same, with the prefix cache on, fed the interleaved stream
                    in order (so cache state carries across requests/sessions)
+  cache+segcache   same, with the prefix and segment caches both on
   encode+segcache  same, with the segment cache on (256 MiB)
   segcache-evict   same, with a 1 MiB segment cache that evicts constantly
-  split_special    split_special_tokens=True (untrusted-text path)
+  split_special    split_special_tokens=True (untrusted-text path), with and
+                   without the prefix cache
   ordinary+cache   encode_ordinary with the cache on == without it
   batch            encode_batch == reference
   threads          several Python threads sharing one cached tokenizer
@@ -126,12 +128,16 @@ def check_model(model: str, args) -> bool:
     cached = with_cache(model, 2 * args.sessions)
     run("encode+cache", lambda c: [c.compare(w, cached.encode(p).ids, e, ref) for w, p, e in zip(where, prompts, exp)])
 
-    def split_special(c):
-        sel = list(range(0, len(prompts), 8))
+    both = with_env(model, FASTOKENS_INPUT_CACHE=2 * args.sessions, FASTOKENS_SEGMENT_CACHE=256)
+    run("cache+segcache", lambda c: [c.compare(w, both.encode(p).ids, e, ref) for w, p, e in zip(where, prompts, exp)])
+
+    def split_special(c, tok, step):
+        sel = list(range(0, len(prompts), step))
         refs = ref.encode_text_batch([prompts[i] for i in sel])
         for i, e in zip(sel, refs):
-            c.compare(where[i], fast.encode(prompts[i], split_special_tokens=True).ids, array("I", e), ref)
-    run("split_special", split_special)
+            c.compare(where[i], tok.encode(prompts[i], split_special_tokens=True).ids, array("I", e), ref)
+    run("split_special", lambda c: split_special(c, fast, 8))
+    run("split_special+cache", lambda c: split_special(c, with_cache(model, 2 * args.sessions), 1))
 
     for name, mib in (("encode+segcache", 256), ("segcache-evict", 1)):
         seg = with_env(model, FASTOKENS_SEGMENT_CACHE=mib)
