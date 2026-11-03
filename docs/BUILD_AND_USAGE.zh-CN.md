@@ -4,13 +4,16 @@
 
 ## 1. 改动一览
 
-| 提交 | 内容 | 是否需要开关 | 效果（M2 Pro 实测） |
+2026-11 起，本 fork 的 main 在上游 main `22003db` 上重建：下表前几项里有的已由上游实现，本 fork 不再单独维护；重建前的 fork main 保存在 `archive/main-410551d` 分支。"效果"一列是重建前在旧 fork main 上的实测（M2 Pro），没有在新基线上重测。
+
+| 来源 | 内容 | 是否需要开关 | 效果（旧 fork main，M2 Pro 实测） |
 |---|---|---|---|
-| `a4bccb7` `c6faa37` `9a9ac51` | agent 负载测试工具：正确性检查、性能基准、流量模拟（`examples/agent/`） | — | — |
-| `293df0c` | 编码较长输入（≥16 KB）时释放 Python GIL；修复 `encode_batch_flat` 与 `enable_truncation` 等并发时会卡死整个进程的死锁 | 自动生效 | 编码期间其他线程被卡住的时间（p99）从 10–23 ms 降到约 1.6 ms；8 个线程的总吞吐提升 2–4 倍 |
-| `20346fc` | 带特殊标记（chat template 输出）的请求也走手写的快速切词器 | 自动生效，仅限 o200k / Kimi 类切词规则（gpt-oss、Kimi 等） | 20 万 token 的请求：gpt-oss 8.8 → 1.2 ms，Kimi 40 → 2.0 ms |
-| `bb81622` | 段缓存：按内容缓存特殊标记之间每一段文字的编码结果，多轮对话中只计算新出现的段 | 需开启 `FASTOKENS_SEGMENT_CACHE` | 一个 153 次请求的 agent 会话总耗时：Qwen3-Coder、GLM、MiniMax 快 5.7–6.8 倍，DeepSeek 快 15 倍 |
-| `6813d6a` | 生成 Python 列表（`ids`、`attention_mask` 等）时复用整数对象、批量填充相同值 | 自动生效 | 经 transformers 调用时，开段缓存的单次请求再快 1.6–1.8 倍 |
+| 本 fork | agent 负载测试工具：正确性检查、性能基准、流量模拟（`examples/agent/`） | — | — |
+| 上游 #74、#85；本 fork 补上 `encode_segments` | 编码较长输入时释放 Python GIL（`encode`、`encode_ordinary`、`encode_segments` 从 32 KiB 起，`encode_batch`、`encode_batch_flat` 总是释放）；批量接口与 `enable_truncation` 等并发时不再死锁 | 自动生效 | 编码期间其他线程被卡住的时间（p99）从 10–23 ms 降到约 1.6 ms；8 个线程的总吞吐提升到原来的 2–4 倍 |
+| 上游 #74 | 带特殊标记（chat template 输出）的请求也走手写的快速切词器 | 自动生效，限有手写切词器的切词规则 | 20 万 token 的请求：gpt-oss 8.8 → 1.2 ms，Kimi 40 → 2.0 ms |
+| 上游 #81、#83、#87 | 段缓存：按内容缓存特殊标记之间每一段文字的编码结果，多轮对话中只计算新出现的段；分词器和它的深拷贝共用一份 | 需开启 `FASTOKENS_SEGMENT_CACHE` | 一个 153 次请求的 agent 会话总耗时：Qwen3-Coder、GLM、MiniMax 降到原来的 1/5.7–1/6.8，DeepSeek 降到 1/15 |
+| 上游 #74 | 生成 Python 列表（`ids`、`attention_mask` 等）时复用整数对象、批量填充相同值 | 自动生效 | 经 transformers 调用时，开段缓存的单次请求耗时降到原来的 1/1.6–1/1.8 |
+| 本 fork | 前缀缓存也复用推理请求（含特殊标记的输入）、`observe` 剖析功能、A3 构建 | 前缀缓存需开启 `FASTOKENS_INPUT_CACHE`；`observe` 需编译时打开 | 见 `docs/PREFIX_CACHE_INFERENCE.zh-CN.md`、`docs/OBSERVE.zh-CN.md`、`docs/OPERATIONS.zh-CN.md` |
 
 以 GLM-5.2 为例，128 个 opencode 会话的真实流量模拟中，分词给每个请求增加的延迟（p50 / p99）：HF tokenizers 为 193 / 1716 ms，fastokens 改动前为 9.9 / 31 ms，改动后开启段缓存为 4.7 / 10.9 ms。
 
@@ -218,12 +221,12 @@ FASTOKENS_SEGMENT_CACHE=1024 python -c "import fastokens; fastokens.patch_transf
 
 | 环境变量 / 接口 | 作用 | 默认 |
 |---|---|---|
-| `FASTOKENS_SEGMENT_CACHE=<MiB>` | 开启段缓存，数值是内存上限（缓存的文本加 token id）。Rust 中对应 `Tokenizer::enable_segment_cache(bytes)` | 关闭 |
+| `FASTOKENS_SEGMENT_CACHE=<MiB>` | 开启段缓存，数值是内存上限（缓存的文本加 token id）。Python 中对应 `Tokenizer.enable_segment_cache(bytes)`，Rust 中对应 `Tokenizer::enable_segment_cache(bytes)`；深拷贝出来的副本与原分词器共用一份 | 关闭 |
 | `FASTOKENS_INPUT_CACHE=<条数>` | 前缀缓存，数值是保留的最近输入条数，建议取并发会话数的 1.5–2 倍。chat template 输出（含特殊标记）会找与它共享最长字节前缀的缓存输入，复用到共享部分里最后一个特殊标记为止；新请求是同一会话的延续时替换那一条，只和它共享系统提示的其他会话不替换。每条约占输入文本的 2.2 倍（文本加每 token 4 字节）。不含特殊标记的纯文本沿用原有逻辑（仅 o200k / Kimi 类切词规则），只受条数限制。与段缓存同时开启时，前缀之后的部分再走段缓存。Rust 中对应 `Tokenizer::enable_input_cache(capacity)` | 关闭 |
 | `FASTOKENS_INPUT_CACHE_MIB=<MiB>` | 前缀缓存（推理请求部分）的内存上限：条数或字节数任一超限就淘汰最久没用的条目；单条超过上限 1/64 的输入不缓存。预算按每个 Tokenizer 实例计：两种缓存都开时，单个实例最多占两者之和（默认 2048 MiB 加段缓存的预算）；vLLM 这类分词器拷贝池里每份拷贝各占一份。Rust 中对应 `Tokenizer::enable_input_cache_with_budget(capacity, bytes)`，小于 1 MiB 按 1 MiB 算 | 2048 |
 | `FASTOKENS_BPE_THREADS=<数量>` | 单个请求内部并行使用的线程数 | 全部逻辑核（Apple Silicon 上为性能核数） |
-| 释放 GIL | `encode`、`encode_ordinary`、`encode_segments`、`encode_batch` 在输入 ≥16 KB 时自动释放 | 始终开启 |
-| 带标记请求走快速切词器 | 对 o200k / Kimi 类切词规则自动生效 | 始终开启 |
+| 释放 GIL | `encode`、`encode_ordinary`、`encode_segments` 在输入 ≥32 KiB 时自动释放，`encode_batch`、`encode_batch_flat` 总是释放 | 始终开启 |
+| 带标记请求走快速切词器 | 对有手写切词器的切词规则自动生效 | 始终开启 |
 | Python 列表转换优化 | 自动生效。token id 对应的整数对象会常驻内存，按常见词表大小约占几 MB | 始终开启 |
 
 环境变量在创建分词器时读取，所以必须在进程启动前、或调用 `patch_transformers()` 之前设置好。
@@ -297,7 +300,7 @@ git worktree remove ../fastokens-main
 
 ## 5. 已知问题（与本次改动无关）
 
-- `python/tests/test_decode_sanitize.py` 中有 4 个测试在 main 上就失败（测试里构造的 BPE 配置解析失败）。CI 不运行这个文件，所以一直没被发现。
+- `python/tests/test_decode_sanitize.py` 在重建前的 fork main 上有 4 个测试失败（测试里构造的 BPE 配置解析失败）；上游已修复，新基线上全部通过。
 - `Tokenizer.from_model` 加载 Kimi 这类只有 `tiktoken.model` 的仓库时，每次都会联网查询一个并不存在的 `tokenizer.json`，网络抖动（如 HTTP 504）会导致加载失败，离线环境也无法使用。
-- `cargo clippy --all-targets` 在 `examples/simple_bench.rs` 和 `src/models/bpe.rs` 的测试代码中有 2 条原有告警。CI 只检查 `cargo clippy`，不受影响。
+- `cargo clippy --all-targets` 在 `examples/simple_bench.rs`、`src/models/bpe.rs` 和 `src/component_parity_tests.rs` 的测试代码中有 5 条上游原有告警。CI 只检查 `cargo clippy`，不受影响。
 - 文中所有性能数字都在 Apple M2 Pro（6 个性能核）上测得。服务器 CPU 单核通常更慢、核数更多，绝对数值会不同，但各版本之间的相对差异不变。
