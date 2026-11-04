@@ -127,22 +127,10 @@ pub fn __bench_scan_fast(text: &str, kind: &str) -> usize {
     n
 }
 
-/// Benchmark-only hook: run just the bit-parallel classify kernel over `text`
-/// in 64-byte blocks, returning a checksum so the work is not optimized away.
-/// Measures the SIMD classify foundation's raw throughput.
+/// Benchmark-only hooks: one classify kernel alone over `text`, and the choice of
+/// aarch64 classify kernels (see `scan_simd::__bench_classify_only`).
 #[doc(hidden)]
-pub fn __bench_classify_only(text: &str) -> u64 {
-    use crate::pre_tokenizers::scan_simd::classify_block;
-    let bytes = text.as_bytes();
-    let mut acc = 0u64;
-    let mut off = 0;
-    while off < bytes.len() {
-        let c = classify_block(bytes, off);
-        acc ^= c.alpha ^ c.digit ^ c.ws ^ c.nl ^ c.other ^ c.nonascii;
-        off += 64;
-    }
-    acc
-}
+pub use crate::pre_tokenizers::scan_simd::{__bench_classify_only, __bench_set_simd, __bench_simd};
 
 use std::{
     collections::{HashMap, VecDeque},

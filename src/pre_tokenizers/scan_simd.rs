@@ -75,19 +75,23 @@ fn in_range(word: u64, lo: u8, hi: u8) -> u64 {
 /// of `bytes` (when the final block is short) are left unset in every map.
 ///
 /// Dispatches to the SVE kernel on aarch64 CPUs that have SVE, a NEON kernel on
-/// other aarch64 CPUs (16 bytes/op) and the portable SWAR kernel elsewhere; all
-/// produce identical bitmaps (`classify_matches_scalar`, and `neon_matches_swar`
-/// and `sve_matches_neon_and_portable` on aarch64).
-#[inline]
+/// other aarch64 CPUs (16 bytes/op) and the portable SWAR kernel elsewhere (on
+/// aarch64 a benchmark can pick the kernel, see [`simd`]); all produce identical
+/// bitmaps (`classify_matches_scalar`, and `neon_matches_swar` and
+/// `sve_matches_neon_and_portable` on aarch64).
+// On aarch64 three kernels hide behind this; keep it inlined into the scan loops.
+#[cfg_attr(target_arch = "aarch64", inline(always))]
+#[cfg_attr(not(target_arch = "aarch64"), inline)]
 pub(crate) fn classify_block(bytes: &[u8], off: usize) -> Classes {
     #[cfg(target_arch = "aarch64")]
     {
-        if sve::available() {
-            // SAFETY: SVE support was just detected.
-            return unsafe { sve::classify_block(bytes, off) };
+        match simd::kernel() {
+            // SAFETY: `simd` picks SVE2 / SVE only on CPUs that have them.
+            simd::Kernel::Sve2 => unsafe { sve::v2::classify_block(bytes, off) },
+            simd::Kernel::Sve => unsafe { sve::classify_block(bytes, off) },
+            // SAFETY: NEON is baseline on aarch64.
+            simd::Kernel::Neon => unsafe { classify_block_neon(bytes, off) },
         }
-        // SAFETY: NEON is baseline on aarch64.
-        unsafe { classify_block_neon(bytes, off) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -537,19 +541,22 @@ fn han_mask(bytes: &[u8], off: usize) -> u64 {
 
 /// Arch-dispatching wrapper for [`classify_block_bulk`]. `CASED` requests the o200k
 /// extra masks (uppercase, `/`).
-#[inline]
+// On aarch64 three kernels hide behind this; keep it inlined into the scan loops.
+#[cfg_attr(target_arch = "aarch64", inline(always))]
+#[cfg_attr(not(target_arch = "aarch64"), inline)]
 fn unsafe_bulk_classify<const CASED: bool, const HAN: bool>(
     bytes: &[u8],
     off: usize,
 ) -> BulkClasses {
     #[cfg(target_arch = "aarch64")]
     {
-        if sve::available() {
-            // SAFETY: SVE support was just detected.
-            return unsafe { sve::classify_block_bulk::<CASED, HAN>(bytes, off) };
+        match simd::kernel() {
+            // SAFETY: `simd` picks SVE2 / SVE only on CPUs that have them.
+            simd::Kernel::Sve2 => unsafe { sve::v2::classify_block_bulk::<CASED, HAN>(bytes, off) },
+            simd::Kernel::Sve => unsafe { sve::classify_block_bulk::<CASED, HAN>(bytes, off) },
+            // SAFETY: NEON is baseline on aarch64.
+            simd::Kernel::Neon => unsafe { classify_block_bulk::<CASED, HAN>(bytes, off) },
         }
-        // SAFETY: NEON is baseline on aarch64.
-        unsafe { classify_block_bulk::<CASED, HAN>(bytes, off) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1935,16 +1942,18 @@ struct DsClasses {
     cg: u64,
 }
 
-/// aarch64 DeepSeek classify: the SVE kernel where the CPU has it, else NEON.
+/// aarch64 DeepSeek classify: the SVE kernel where the CPU has it, else NEON (or
+/// the kernel a benchmark picked, see [`simd`]).
 #[cfg(target_arch = "aarch64")]
-#[inline]
+#[inline(always)]
 unsafe fn classify_block_ds<const VIRT: bool>(bytes: &[u8], off: usize) -> DsClasses {
-    if sve::available() {
-        // SAFETY: SVE support was just detected.
-        return unsafe { sve::classify_block_ds::<VIRT>(bytes, off) };
+    match simd::kernel() {
+        // SAFETY: `simd` picks SVE2 / SVE only on CPUs that have them.
+        simd::Kernel::Sve2 => unsafe { sve::v2::classify_block_ds::<VIRT>(bytes, off) },
+        simd::Kernel::Sve => unsafe { sve::classify_block_ds::<VIRT>(bytes, off) },
+        // SAFETY: NEON is baseline on aarch64.
+        simd::Kernel::Neon => unsafe { classify_block_ds_neon::<VIRT>(bytes, off) },
     }
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { classify_block_ds_neon::<VIRT>(bytes, off) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3854,6 +3863,143 @@ mod avx512 {
     }
 }
 
+// ── aarch64 kernel choice ────────────────────────────────────────────────────
+
+/// Which classify kernels run on aarch64: SVE on CPUs that have it, else NEON.
+/// The SVE2 kernels ([`sve::v2`]) run only when asked for: a benchmark names the
+/// kernel in `FASTOKENS_SIMD` (`neon`, `sve` or `sve2`, read once, at the first
+/// classify) or switches with [`__bench_set_simd`]. A kernel the CPU cannot run is
+/// never picked; asking for one leaves the default.
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod simd {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Kernel {
+        Neon = 1,
+        Sve = 2,
+        Sve2 = 3,
+    }
+
+    impl Kernel {
+        pub(crate) fn name(self) -> &'static str {
+            match self {
+                Kernel::Neon => "neon",
+                Kernel::Sve => "sve",
+                Kernel::Sve2 => "sve2",
+            }
+        }
+    }
+
+    /// 0 until the first classify reads `FASTOKENS_SIMD`, then a [`Kernel`].
+    static CHOICE: AtomicU8 = AtomicU8::new(0);
+
+    #[inline(always)]
+    pub(crate) fn kernel() -> Kernel {
+        match CHOICE.load(Relaxed) {
+            1 => Kernel::Neon,
+            2 => Kernel::Sve,
+            3 => Kernel::Sve2,
+            _ => init(),
+        }
+    }
+
+    #[cold]
+    fn init() -> Kernel {
+        let name = std::env::var("FASTOKENS_SIMD").ok();
+        let k = pick(
+            name.as_deref(),
+            super::sve::available(),
+            super::sve::available2(),
+        );
+        CHOICE.store(k as u8, Relaxed);
+        k
+    }
+
+    /// The kernel for request `name` on a CPU with or without SVE / SVE2: the one
+    /// named if the CPU has it, else the default (SVE if the CPU has it, else NEON).
+    pub(crate) fn pick(name: Option<&str>, sve: bool, sve2: bool) -> Kernel {
+        match name {
+            Some("neon") => Kernel::Neon,
+            Some("sve2") if sve2 => Kernel::Sve2,
+            _ if sve => Kernel::Sve,
+            _ => Kernel::Neon,
+        }
+    }
+
+    /// Switch kernels: `Err` when `name` is not a kernel or this CPU cannot run it.
+    pub(crate) fn set(name: &str) -> Result<Kernel, String> {
+        let (sve, sve2) = (super::sve::available(), super::sve::available2());
+        let runs = match name {
+            "neon" => true,
+            "sve" => sve,
+            "sve2" => sve2,
+            _ => return Err(format!("unknown kernel {name:?}: neon, sve or sve2")),
+        };
+        if !runs {
+            return Err(format!("this CPU cannot run the {name} kernels"));
+        }
+        let k = pick(Some(name), sve, sve2);
+        CHOICE.store(k as u8, Relaxed);
+        Ok(k)
+    }
+}
+
+/// Benchmark-only: the classify kernels in use (`neon`, `sve` or `sve2`), or
+/// `None` off aarch64.
+#[doc(hidden)]
+pub fn __bench_simd() -> Option<&'static str> {
+    #[cfg(target_arch = "aarch64")]
+    return Some(simd::kernel().name());
+    #[cfg(not(target_arch = "aarch64"))]
+    None
+}
+
+/// Benchmark-only: switch the aarch64 classify kernels to `name` (`neon`, `sve`
+/// or `sve2`) for the whole process; `Err` off aarch64, for an unknown name, or
+/// when this CPU cannot run that kernel.
+#[doc(hidden)]
+pub fn __bench_set_simd(name: &str) -> Result<&'static str, String> {
+    #[cfg(target_arch = "aarch64")]
+    return simd::set(name).map(simd::Kernel::name);
+    #[cfg(not(target_arch = "aarch64"))]
+    Err(format!("no kernel choice off aarch64 ({name:?})"))
+}
+
+/// Benchmark-only: the classify kernel of scan `kind` alone over `text`, one
+/// 64-byte block at a time, every class word XORed into the result (so the work
+/// is not optimized away); no boundary logic. `kind`: `cl100k` (the plain bulk
+/// classify, also GLM's and Qwen's), `o200k` (cased), `kimi` (cased + Han),
+/// `deepseek` (DeepSeek's), `full` (the full [`Classes`] classify).
+#[doc(hidden)]
+pub fn __bench_classify_only(text: &str, kind: &str) -> u64 {
+    fn blocks(b: &[u8], f: impl Fn(&[u8], usize) -> u64) -> u64 {
+        (0..b.len()).step_by(64).fold(0, |acc, off| acc ^ f(b, off))
+    }
+    fn bulk(c: BulkClasses) -> u64 {
+        c.alpha ^ c.digit ^ c.ws ^ c.nl ^ c.sp ^ c.ap ^ c.up ^ c.slash ^ c.han ^ c.bad as u64
+    }
+    let b = text.as_bytes();
+    match kind {
+        "o200k" => blocks(b, |b, off| {
+            bulk(unsafe_bulk_classify::<true, false>(b, off))
+        }),
+        "kimi" => blocks(b, |b, off| bulk(unsafe_bulk_classify::<true, true>(b, off))),
+        "deepseek" => blocks(b, |b, off| {
+            // SAFETY: the dispatcher picks a kernel this CPU runs.
+            let c = unsafe { classify_block_ds::<false>(b, off) };
+            c.alpha ^ c.digit ^ c.ws ^ c.nl ^ c.sp ^ c.ctrl ^ c.hi
+        }),
+        "full" => blocks(b, |b, off| {
+            let c = classify_block(b, off);
+            c.alpha ^ c.digit ^ c.ws ^ c.nl ^ c.other ^ c.nonascii ^ c.sp ^ c.ap
+        }),
+        _ => blocks(b, |b, off| {
+            bulk(unsafe_bulk_classify::<false, false>(b, off))
+        }),
+    }
+}
+
 // ── aarch64 SVE classify kernels ─────────────────────────────────────────────
 
 /// SVE versions of the classify kernels (aarch64), selected at runtime on CPUs
@@ -3881,6 +4027,12 @@ mod sve {
     #[inline(always)]
     pub(super) fn available() -> bool {
         std::arch::is_aarch64_feature_detected!("sve")
+    }
+
+    /// Whether this CPU runs the SVE2 kernels ([`v2`]).
+    #[inline(always)]
+    pub(super) fn available2() -> bool {
+        std::arch::is_aarch64_feature_detected!("sve2")
     }
 
     /// Predicate slots per class in a store buffer: a 64-byte block is at most 4
@@ -4277,6 +4429,270 @@ mod sve {
             c.cg = w(4);
         }
         c
+    }
+
+    /// SVE2 versions of the kernels above, the same except that whitespace and
+    /// newlines are each one `match` against the set of their bytes instead of
+    /// range compares and an `orr`. The class predicates go to the same slots of
+    /// the same store buffer and are read back by the same [`word`]. They only run
+    /// when a benchmark asks for them (see [`super::simd`]).
+    pub(super) mod v2 {
+        use core::arch::asm;
+        use core::mem::MaybeUninit;
+
+        use super::super::{BulkClasses, Classes, DsClasses};
+        use super::{CLASS_WORDS, block, pred_bytes, slot, word};
+
+        /// The `\s` bytes and the `[\r\n]` bytes, each padded to the 16 bytes that
+        /// `match` compares against (`ld1rqb` repeats them in every 128-bit segment).
+        static WS: [u8; 16] = [
+            9, 10, 11, 12, 13, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        ];
+        static NL: [u8; 16] = [
+            10, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+        ];
+
+        /// [`classify`](super::classify) with SVE2, and `z25` = [`WS`], `z26` = [`NL`].
+        macro_rules! classify2 {
+            ($src:expr, $n:expr, $buf:expr, [$($pre:expr),* $(,)?], [$($body:expr),* $(,)?]) => {
+                asm!(
+                    ".arch_extension sve2",
+                    "ptrue p1.b",
+                    "ld1rqb {{z25.b}}, p1/z, [{ws}]",
+                    "ld1rqb {{z26.b}}, p1/z, [{nl}]",
+                    $($pre,)*
+                    "mov {i}, #0",
+                    "2:",
+                    "whilelo p0.b, {i}, {n}",
+                    "ld1b {{z0.b}}, p0/z, [{src}, {i}]",
+                    $($body,)*
+                    "addpl {b}, {b}, #1",
+                    "incb {i}",
+                    "cmp {i}, #64",
+                    "b.lo 2b",
+                    src = in(reg) $src,
+                    n = in(reg) $n,
+                    b = inout(reg) $buf => _,
+                    ws = in(reg) WS.as_ptr(),
+                    nl = in(reg) NL.as_ptr(),
+                    i = out(reg) _,
+                    out("z0") _, out("z1") _, out("z25") _, out("z26") _,
+                    out("z27") _, out("z28") _, out("z29") _, out("z30") _, out("z31") _,
+                    out("p0") _, out("p1") _, out("p2") _, out("p3") _,
+                    out("p4") _, out("p5") _, out("p6") _, out("p7") _,
+                    options(nostack),
+                )
+            };
+        }
+
+        /// [`ascii_tests`](super::ascii_tests) with one `match` each for `\s` (→ `p3`)
+        /// and `[\r\n]` (→ `p5`).
+        macro_rules! ascii_tests2 {
+            () => {
+                concat!(
+                    "orr z1.d, z0.d, z31.d\n",
+                    "cmphs p1.b, p0/z, z1.b, #97\n",
+                    "cmpls p1.b, p1/z, z1.b, #122\n",
+                    "cmphs p2.b, p0/z, z0.b, #48\n",
+                    "cmpls p2.b, p2/z, z0.b, #57\n",
+                    "cmpeq p4.b, p0/z, z0.b, z31.b\n",
+                    "match p3.b, p0/z, z0.b, z25.b\n",
+                    "match p5.b, p0/z, z0.b, z26.b\n",
+                )
+            };
+        }
+
+        /// SVE2 [`super::super::classify_block_swar`].
+        ///
+        /// # Safety
+        /// The CPU must have SVE2.
+        #[inline(always)]
+        pub(in super::super) unsafe fn classify_block(bytes: &[u8], off: usize) -> Classes {
+            let (src, n) = block(bytes, off);
+            let valid = if n == 64 { !0 } else { (1u64 << n) - 1 };
+            let mut buf = MaybeUninit::<[u64; 7 * CLASS_WORDS]>::uninit();
+            let b = buf.as_mut_ptr().cast::<u8>();
+            // SAFETY: SVE2 (caller); reads `n` bytes at `src`, writes 7 classes to `buf`.
+            unsafe {
+                classify2!(
+                    src,
+                    n,
+                    b,
+                    ["mov z31.b, #32", "mov z30.b, #39"],
+                    [ascii_tests2!(), ap_nonascii!(), store7!()]
+                );
+            }
+            // SAFETY: SVE (caller); `buf` holds the classes just stored.
+            let pl = unsafe { pred_bytes() };
+            let w = |k| unsafe { word(b, k, pl) };
+            let (alpha, digit, ws, nonascii) = (
+                w(slot::ALPHA),
+                w(slot::DIGIT),
+                w(slot::WS),
+                w(slot::NONASCII),
+            );
+            Classes {
+                alpha,
+                digit,
+                ws,
+                nl: w(slot::NL),
+                other: valid & !nonascii & !(alpha | digit | ws),
+                nonascii,
+                sp: w(slot::SP),
+                ap: w(slot::AP),
+            }
+        }
+
+        /// SVE2 [`super::super::classify_block_bulk_portable`].
+        ///
+        /// # Safety
+        /// The CPU must have SVE2.
+        #[inline(always)]
+        pub(in super::super) unsafe fn classify_block_bulk<const CASED: bool, const HAN: bool>(
+            bytes: &[u8],
+            off: usize,
+        ) -> BulkClasses {
+            let (src, n) = block(bytes, off);
+            let mut buf = MaybeUninit::<[u64; 10 * CLASS_WORDS]>::uninit();
+            let b = buf.as_mut_ptr().cast::<u8>();
+            // SAFETY: SVE2 (caller); reads `n` bytes at `src`, writes up to 10 classes
+            // to `buf`.
+            unsafe {
+                match (CASED, HAN) {
+                    (false, false) => classify2!(
+                        src,
+                        n,
+                        b,
+                        ["mov z31.b, #32", "mov z30.b, #39"],
+                        [ascii_tests2!(), ap_nonascii!(), store7!()]
+                    ),
+                    (true, false) => classify2!(
+                        src,
+                        n,
+                        b,
+                        ["mov z31.b, #32", "mov z30.b, #39", "mov z29.b, #47"],
+                        [ascii_tests2!(), ap_nonascii!(), store7!(), cased!()]
+                    ),
+                    (false, true) => classify2!(
+                        src,
+                        n,
+                        b,
+                        ["mov z31.b, #32", "mov z30.b, #39", "mov z28.b, #-128"],
+                        [ascii_tests2!(), ap_nonascii!(), store7!(), han!()]
+                    ),
+                    (true, true) => classify2!(
+                        src,
+                        n,
+                        b,
+                        [
+                            "mov z31.b, #32",
+                            "mov z30.b, #39",
+                            "mov z29.b, #47",
+                            "mov z28.b, #-128"
+                        ],
+                        [ascii_tests2!(), ap_nonascii!(), store7!(), cased!(), han!()]
+                    ),
+                }
+            }
+            // SAFETY: SVE (caller); `buf` holds the classes just stored.
+            let pl = unsafe { pred_bytes() };
+            let w = |k| unsafe { word(b, k, pl) };
+            let nonascii = w(slot::NONASCII);
+            let han = if HAN { w(slot::HAN) } else { 0 };
+            let (up, slash) = if CASED {
+                (w(slot::UP), w(slot::SLASH))
+            } else {
+                (0, 0)
+            };
+            BulkClasses {
+                alpha: w(slot::ALPHA),
+                digit: w(slot::DIGIT),
+                ws: w(slot::WS),
+                nl: w(slot::NL),
+                sp: w(slot::SP),
+                ap: w(slot::AP),
+                up,
+                slash,
+                han,
+                // Only non-ASCII is bad — except Kimi's Han stand-in `0x80` when `HAN`.
+                bad: nonascii & !han != 0,
+            }
+        }
+
+        /// SVE2 [`super::super::classify_block_ds_scalar`]. The stand-in classes of
+        /// `VIRT` input take [`super::classify_block_ds`]'s SVE pass.
+        ///
+        /// # Safety
+        /// The CPU must have SVE2.
+        #[inline(always)]
+        pub(in super::super) unsafe fn classify_block_ds<const VIRT: bool>(
+            bytes: &[u8],
+            off: usize,
+        ) -> DsClasses {
+            let (src, n) = block(bytes, off);
+            let mut buf = MaybeUninit::<[u64; 7 * CLASS_WORDS]>::uninit();
+            let b = buf.as_mut_ptr().cast::<u8>();
+            // SAFETY: SVE2 (caller); reads `n` bytes at `src`, writes 7 classes to `buf`.
+            unsafe {
+                classify2!(
+                    src,
+                    n,
+                    b,
+                    ["mov z31.b, #32", "mov z30.b, #127"],
+                    [ascii_tests2!(), ctrl_hi!(), store7!()]
+                );
+            }
+            // SAFETY: SVE (caller); `buf` holds the classes just stored.
+            let pl = unsafe { pred_bytes() };
+            let w = |k| unsafe { word(b, k, pl) };
+            let mut c = DsClasses {
+                alpha: w(slot::ALPHA),
+                digit: w(slot::DIGIT),
+                ws: w(slot::WS),
+                nl: w(slot::NL),
+                sp: w(slot::SP),
+                ctrl: w(slot::AP),
+                hi: w(slot::NONASCII),
+                ..DsClasses::default()
+            };
+            if VIRT && c.hi != 0 {
+                // The five stand-ins `DS_VL..=DS_CG` as classes 0..=4, the SVE pass of
+                // [`super::classify_block_ds`].
+                // SAFETY: as above, 5 classes.
+                unsafe {
+                    classify!(
+                        src,
+                        n,
+                        b,
+                        [
+                            "mov z27.b, #-128",
+                            "mov z28.b, #-127",
+                            "mov z29.b, #-126",
+                            "mov z30.b, #-125",
+                            "mov z31.b, #-124",
+                        ],
+                        [
+                            "cmpeq p1.b, p0/z, z0.b, z27.b",
+                            "cmpeq p2.b, p0/z, z0.b, z28.b",
+                            "cmpeq p3.b, p0/z, z0.b, z29.b",
+                            "cmpeq p4.b, p0/z, z0.b, z30.b",
+                            "cmpeq p5.b, p0/z, z0.b, z31.b",
+                            "str p1, [{b}]",
+                            "str p2, [{b}, #4, mul vl]",
+                            "str p3, [{b}, #8, mul vl]",
+                            "str p4, [{b}, #12, mul vl]",
+                            "str p5, [{b}, #16, mul vl]",
+                        ]
+                    );
+                }
+                c.vl = w(0);
+                c.vp = w(1);
+                c.cl = w(2);
+                c.cp = w(3);
+                c.cg = w(4);
+            }
+            c
+        }
     }
 }
 
@@ -5519,9 +5935,11 @@ mod tests {
         if !sve::available() {
             return;
         }
+        let sve2 = sve::available2();
         eprintln!(
-            "SVE vector length: {} bits",
-            unsafe { sve::pred_bytes() } * 64
+            "SVE vector length: {} bits, SVE2 kernels {}",
+            unsafe { sve::pred_bytes() } * 64,
+            if sve2 { "tested" } else { "skipped (no SVE2)" }
         );
         macro_rules! same {
             ($sve:expr, $portable:expr, $neon:expr, $ctx:expr) => {{
@@ -5612,8 +6030,105 @@ mod tests {
                         classify_block_ds_neon::<true>(&buf, off),
                         ctx
                     );
+                    if !sve2 {
+                        continue;
+                    }
+                    let ctx = format!("sve2, {ctx}");
+                    same!(
+                        sve::v2::classify_block(&buf, off),
+                        classify_block_swar(&buf, off),
+                        classify_block_neon(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::v2::classify_block_bulk::<false, false>(&buf, off),
+                        classify_block_bulk_portable::<false, false>(&buf, off),
+                        classify_block_bulk::<false, false>(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::v2::classify_block_bulk::<true, false>(&buf, off),
+                        classify_block_bulk_portable::<true, false>(&buf, off),
+                        classify_block_bulk::<true, false>(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::v2::classify_block_bulk::<true, true>(&buf, off),
+                        classify_block_bulk_portable::<true, true>(&buf, off),
+                        classify_block_bulk::<true, true>(&buf, off),
+                        ctx
+                    );
+                    same_bulk!(
+                        sve::v2::classify_block_bulk::<false, true>(&buf, off),
+                        classify_block_bulk_portable::<false, true>(&buf, off),
+                        classify_block_bulk::<false, true>(&buf, off),
+                        ctx
+                    );
+                    same!(
+                        sve::v2::classify_block_ds::<false>(&buf, off),
+                        classify_block_ds_scalar::<false>(&buf, off),
+                        classify_block_ds_neon::<false>(&buf, off),
+                        ctx
+                    );
+                    same!(
+                        sve::v2::classify_block_ds::<true>(&buf, off),
+                        classify_block_ds_scalar::<true>(&buf, off),
+                        classify_block_ds_neon::<true>(&buf, off),
+                        ctx
+                    );
                 }
             }
+        }
+    }
+
+    /// `FASTOKENS_SIMD` picks only a kernel the CPU runs; anything else is the
+    /// default, SVE where the CPU has it, else NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn simd_pick_never_asks_for_a_missing_kernel() {
+        use simd::{Kernel, pick};
+        for (sve, sve2) in [(false, false), (true, false), (true, true)] {
+            let default = if sve { Kernel::Sve } else { Kernel::Neon };
+            assert_eq!(pick(None, sve, sve2), default);
+            assert_eq!(pick(Some(""), sve, sve2), default);
+            assert_eq!(pick(Some("avx2"), sve, sve2), default);
+            assert_eq!(pick(Some("neon"), sve, sve2), Kernel::Neon);
+            assert_eq!(pick(Some("sve"), sve, sve2), default);
+            let k = pick(Some("sve2"), sve, sve2);
+            assert_eq!(k, if sve2 { Kernel::Sve2 } else { default });
+        }
+    }
+
+    /// The benchmark hook's kernel switch: NEON always, SVE / SVE2 only where the
+    /// CPU has them, and every kernel gives the same classify checksum.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bench_set_simd_switches_kernels() {
+        let text = "fn main() {\n\tprintln!(\"it's 42\");\r\n}\n// ünïcödé 中文\n".repeat(40);
+        let before = __bench_simd().unwrap();
+        let mut sums = Vec::new();
+        for name in ["neon", "sve", "sve2"] {
+            let runs = match name {
+                "sve" => sve::available(),
+                "sve2" => sve::available2(),
+                _ => true,
+            };
+            match __bench_set_simd(name) {
+                Ok(k) => {
+                    assert!(runs, "{name} picked on a CPU without it");
+                    assert_eq!((k, __bench_simd()), (name, Some(name)));
+                    for kind in ["cl100k", "o200k", "kimi", "deepseek", "full"] {
+                        sums.push((kind, __bench_classify_only(&text, kind)));
+                    }
+                }
+                Err(_) => assert!(!runs, "{name} refused on a CPU that has it"),
+            }
+        }
+        assert!(__bench_set_simd("avx2").is_err());
+        __bench_set_simd(before).unwrap();
+        for (kind, sum) in &sums {
+            let first = sums.iter().find(|(k, _)| k == kind).unwrap().1;
+            assert_eq!(*sum, first, "{kind}");
         }
     }
 

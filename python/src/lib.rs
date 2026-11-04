@@ -2027,6 +2027,36 @@ impl PyDecodeStream {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark-only hooks (not part of the API)
+// ---------------------------------------------------------------------------
+
+/// The classify kernel of scan `kind` (`cl100k`, `o200k`, `kimi`, `deepseek`,
+/// `full`) alone over `text`, 64 bytes at a time; returns a checksum.
+#[pyfunction]
+fn _bench_classify_only(text: &Bound<'_, PyString>, kind: &str) -> PyResult<u64> {
+    Ok(fastokens::__bench_classify_only(&utf8(text)?, kind))
+}
+
+/// The pre-tokenizer scanner of `kind` alone over `text`; returns the span count.
+#[pyfunction]
+fn _bench_scan_spans(text: &Bound<'_, PyString>, kind: &str) -> PyResult<usize> {
+    Ok(fastokens::__bench_scan_spans(&utf8(text)?, kind).len())
+}
+
+/// The aarch64 classify kernels in use (`neon`, `sve`, `sve2`), or `None`.
+#[pyfunction]
+fn _bench_simd() -> Option<&'static str> {
+    fastokens::__bench_simd()
+}
+
+/// Switch the aarch64 classify kernels for the whole process; `ValueError` when
+/// this CPU cannot run `name`.
+#[pyfunction]
+fn _bench_set_simd(name: &str) -> PyResult<&'static str> {
+    fastokens::__bench_set_simd(name).map_err(PyValueError::new_err)
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -2036,5 +2066,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostProcessor>()?;
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyDecodeStream>()?;
+    m.add_function(wrap_pyfunction!(_bench_classify_only, m)?)?;
+    m.add_function(wrap_pyfunction!(_bench_scan_spans, m)?)?;
+    m.add_function(wrap_pyfunction!(_bench_simd, m)?)?;
+    m.add_function(wrap_pyfunction!(_bench_set_simd, m)?)?;
     Ok(())
 }
